@@ -1813,20 +1813,38 @@ mod tests {
 
     #[test]
     fn collateral_type_parsing_usdc() {
-        assert_eq!(CollateralType::from_str("USDC").unwrap(), CollateralType::Usdc);
-        assert_eq!(CollateralType::from_str("usdc").unwrap(), CollateralType::Usdc);
+        assert_eq!(
+            CollateralType::from_str("USDC").unwrap(),
+            CollateralType::Usdc
+        );
+        assert_eq!(
+            CollateralType::from_str("usdc").unwrap(),
+            CollateralType::Usdc
+        );
     }
 
     #[test]
     fn collateral_type_parsing_eth() {
-        assert_eq!(CollateralType::from_str("ETH").unwrap(), CollateralType::Eth);
-        assert_eq!(CollateralType::from_str("eth").unwrap(), CollateralType::Eth);
+        assert_eq!(
+            CollateralType::from_str("ETH").unwrap(),
+            CollateralType::Eth
+        );
+        assert_eq!(
+            CollateralType::from_str("eth").unwrap(),
+            CollateralType::Eth
+        );
     }
 
     #[test]
     fn collateral_type_parsing_btc() {
-        assert_eq!(CollateralType::from_str("BTC").unwrap(), CollateralType::Btc);
-        assert_eq!(CollateralType::from_str("btc").unwrap(), CollateralType::Btc);
+        assert_eq!(
+            CollateralType::from_str("BTC").unwrap(),
+            CollateralType::Btc
+        );
+        assert_eq!(
+            CollateralType::from_str("btc").unwrap(),
+            CollateralType::Btc
+        );
     }
 
     #[test]
@@ -1835,7 +1853,10 @@ mod tests {
             CollateralType::from_str("STELLAR_XLM").unwrap(),
             CollateralType::StellarXlm
         );
-        assert_eq!(CollateralType::from_str("XLM").unwrap(), CollateralType::StellarXlm);
+        assert_eq!(
+            CollateralType::from_str("XLM").unwrap(),
+            CollateralType::StellarXlm
+        );
     }
 
     #[test]
@@ -1863,7 +1884,10 @@ mod tests {
         assert_eq!(CollateralType::Eth.get_annual_interest_rate(), dec!(0.08));
         assert_eq!(CollateralType::Btc.get_annual_interest_rate(), dec!(0.08));
         // XLM should have highest rate (12%)
-        assert_eq!(CollateralType::StellarXlm.get_annual_interest_rate(), dec!(0.12));
+        assert_eq!(
+            CollateralType::StellarXlm.get_annual_interest_rate(),
+            dec!(0.12)
+        );
     }
 
     #[test]
@@ -1874,7 +1898,10 @@ mod tests {
         assert_eq!(CollateralType::Eth.get_liquidation_threshold(), dec!(0.85));
         assert_eq!(CollateralType::Btc.get_liquidation_threshold(), dec!(0.85));
         // XLM should have lowest threshold (0.80)
-        assert_eq!(CollateralType::StellarXlm.get_liquidation_threshold(), dec!(0.80));
+        assert_eq!(
+            CollateralType::StellarXlm.get_liquidation_threshold(),
+            dec!(0.80)
+        );
     }
 
     #[test]

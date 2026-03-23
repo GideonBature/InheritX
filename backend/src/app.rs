@@ -16,12 +16,11 @@ use crate::auth::{AuthenticatedAdmin, AuthenticatedUser};
 use crate::config::Config;
 use crate::notifications::{AuditLogService, NotificationService};
 use crate::service::{
-    LoanSimulationService, PlanService,
     AdminMetrics, AdminService, ClaimMetricsService, ClaimPlanRequest, CreatePlanRequest,
     EmergencyActionResponse, EmergencyAdminService, KycRecord, KycService, KycStatus,
-    LendingMetrics, LendingMonitoringService, LoanSimulationRequest, PausePlanRequest, PlanService, PlanStatisticsService,
-    RevenueMetricsResponse, RevenueMetricsService, RiskOverrideRequest, UnpausePlanRequest,
-    UserMetricsService,
+    LendingMetrics, LendingMonitoringService, LoanSimulationRequest, LoanSimulationService,
+    PausePlanRequest, PlanService, PlanService, PlanStatisticsService, RevenueMetricsResponse,
+    RevenueMetricsService, RiskOverrideRequest, UnpausePlanRequest, UserMetricsService,
 };
 
 pub struct AppState {
@@ -528,8 +527,7 @@ async fn get_simulation(
     AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<Json<Value>, ApiError> {
     let simulation =
-        LoanSimulationService::get_simulation_by_id(&state.db, simulation_id, user.user_id)
-            .await?;
+        LoanSimulationService::get_simulation_by_id(&state.db, simulation_id, user.user_id).await?;
     match simulation {
         Some(sim) => Ok(Json(json!({
             "status": "success",
