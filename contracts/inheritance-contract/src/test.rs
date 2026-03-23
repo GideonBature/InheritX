@@ -1,7 +1,85 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, vec, Address, Bytes, Env, String, Symbol, Vec};
+use mock_token::MockToken;
+use mock_token::MockTokenClient;
+use soroban_sdk::{testutils::Address as _, token, vec, Address, Bytes, Env, String, Vec};
+
+/// Test helper for balance and mint (uses mock-token crate client).
+struct TestTokenHelper<'a> {
+    env: &'a Env,
+    token: Address,
+}
+
+impl TestTokenHelper<'_> {
+    fn new<'a>(env: &'a Env, token: &'a Address) -> TestTokenHelper<'a> {
+        TestTokenHelper {
+            env,
+            token: token.clone(),
+        }
+    }
+
+    fn balance(&self, id: &Address) -> i128 {
+        token::Client::new(self.env, &self.token).balance(id)
+    }
+
+    fn mint(&self, to: &Address, amount: &i128) {
+        MockTokenClient::new(self.env, &self.token).mint(to, amount);
+    }
+}
+
+// ----- Test setup and param helpers -----
+/// Sets up env with inheritance contract, mock token, admin initialized, owner minted.
+/// Returns (client, token_id, admin, owner).
+fn setup_with_token_and_admin(
+    env: &Env,
+) -> (InheritanceContractClient<'_>, Address, Address, Address) {
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, InheritanceContract);
+    let token_id = env.register_contract(None, MockToken);
+    let admin = create_test_address(env, 100);
+    let owner = create_test_address(env, 1);
+    let client = InheritanceContractClient::new(env, &contract_id);
+    client.initialize_admin(&admin);
+    TestTokenHelper::new(env, &token_id).mint(&owner, &10_000_000i128);
+    (client, token_id, admin, owner)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_params(
+    env: &Env,
+    owner: &Address,
+    token: &Address,
+    plan_name: &str,
+    description: &str,
+    total_amount: u64,
+    distribution_method: DistributionMethod,
+    beneficiaries_data: &Vec<(String, String, u32, Bytes, u32)>,
+) -> CreateInheritancePlanParams {
+    CreateInheritancePlanParams {
+        owner: owner.clone(),
+        token: token.clone(),
+        plan_name: String::from_str(env, plan_name),
+        description: String::from_str(env, description),
+        total_amount,
+        distribution_method,
+        beneficiaries_data: beneficiaries_data.clone(),
+        is_lendable: true,
+    }
+}
+
+fn default_beneficiaries(env: &Env) -> Vec<(String, String, u32, Bytes, u32)> {
+    vec![
+        env,
+        (
+            String::from_str(env, "Alice"),
+            String::from_str(env, "alice@example.com"),
+            111111u32,
+            create_test_bytes(env, "1111111111111111"),
+            10000u32,
+        ),
+    ]
+}
 
 // Helper function to create test address
 fn create_test_address(env: &Env, _seed: u64) -> Address {
@@ -15,6 +93,24 @@ fn create_test_bytes(env: &Env, data: &str) -> Bytes {
         bytes.push_back(*byte);
     }
     bytes
+}
+
+fn one_beneficiary(
+    env: &Env,
+    name: &str,
+    email: &str,
+    claim_code: u32,
+) -> Vec<(String, String, u32, Bytes, u32)> {
+    vec![
+        env,
+        (
+            String::from_str(env, name),
+            String::from_str(env, email),
+            claim_code,
+            create_test_bytes(env, "1111111111111111"),
+            10000u32,
+        ),
+    ]
 }
 
 #[test]
@@ -240,13 +336,8 @@ fn test_create_beneficiary_invalid_data() {
 #[test]
 fn test_add_beneficiary_success() {
     let env = Env::default();
-    env.mock_all_auths(); // Mock all authorizations for testing
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
-
-    // Create a plan first with full allocation
     let beneficiaries_data_full = vec![
         &env,
         (
@@ -258,14 +349,16 @@ fn test_add_beneficiary_success() {
         ),
     ];
 
-    let _plan_id = client.create_inheritance_plan(
+    let _plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data_full,
-    );
+    ));
 
     // This test demonstrates that we can create a plan successfully
     // Testing add_beneficiary requires removing a beneficiary first to make room
@@ -289,13 +382,8 @@ fn test_add_beneficiary_max_limit() {
 #[test]
 fn test_add_beneficiary_allocation_exceeds_limit() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
-
-    // Create plan with 10000 bp (100%)
     let beneficiaries_data = vec![
         &env,
         (
@@ -307,14 +395,16 @@ fn test_add_beneficiary_allocation_exceeds_limit() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Try to add another beneficiary - should fail because allocation would exceed 10000
     let result = client.try_add_beneficiary(
@@ -335,13 +425,8 @@ fn test_add_beneficiary_allocation_exceeds_limit() {
 #[test]
 fn test_remove_beneficiary_success() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
-
-    // Create plan with 2 beneficiaries
     let beneficiaries_data = vec![
         &env,
         (
@@ -360,14 +445,16 @@ fn test_remove_beneficiary_success() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Remove first beneficiary
     let result = client.try_remove_beneficiary(&owner, &plan_id, &0u32);
@@ -391,13 +478,8 @@ fn test_remove_beneficiary_success() {
 #[test]
 fn test_remove_beneficiary_invalid_index() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
-
-    // Create plan with 1 beneficiary
     let beneficiaries_data = vec![
         &env,
         (
@@ -409,14 +491,16 @@ fn test_remove_beneficiary_invalid_index() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Try to remove beneficiary at invalid index
     let result = client.try_remove_beneficiary(&owner, &plan_id, &5u32);
@@ -426,14 +510,9 @@ fn test_remove_beneficiary_invalid_index() {
 #[test]
 fn test_remove_beneficiary_unauthorized() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
-
-    let owner = create_test_address(&env, 1);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
     let unauthorized = create_test_address(&env, 2);
 
-    // Create plan
     let beneficiaries_data = vec![
         &env,
         (
@@ -445,14 +524,16 @@ fn test_remove_beneficiary_unauthorized() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Try to remove with unauthorized address
     let result = client.try_remove_beneficiary(&unauthorized, &plan_id, &0u32);
@@ -462,13 +543,8 @@ fn test_remove_beneficiary_unauthorized() {
 #[test]
 fn test_beneficiary_allocation_tracking() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
-
-    // Create plan with 3 beneficiaries totaling 10000 bp
     let beneficiaries_data = vec![
         &env,
         (
@@ -494,14 +570,16 @@ fn test_beneficiary_allocation_tracking() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Remove one beneficiary (3000 bp)
     client.remove_beneficiary(&owner, &plan_id, &1u32);
@@ -537,12 +615,7 @@ fn test_beneficiary_allocation_tracking() {
 #[test]
 fn test_claim_success() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
-
-    let owner = Address::generate(&env);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
     let beneficiaries = vec![
         &env,
@@ -555,15 +628,22 @@ fn test_claim_success() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Will"),
-        &String::from_str(&env, "Inheritance Plan"),
-        &1000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Will",
+        "Inheritance Plan",
+        1000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries,
-    );
+    ));
 
+    // Claim should succeed and log an event, we now also test if transferring would work if we had the code implemented fully.
+    // NOTE: In the current MVP setup for inheritance-contract, we modified claim_inheritance_plan
+    // to emit the event with the payout amount. In a real integration test with the lending contract,
+    // we would deposit actual mock tokens and verify the beneficiary balance increases.
+    // For this unit test, we just verify it doesn't panic.
     client.claim_inheritance_plan(
         &plan_id,
         &String::from_str(&env, "alice@example.com"),
@@ -575,12 +655,7 @@ fn test_claim_success() {
 #[should_panic]
 fn test_double_claim_fails() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
-
-    let owner = Address::generate(&env);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
     let beneficiaries = vec![
         &env,
@@ -593,14 +668,16 @@ fn test_double_claim_fails() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Will"),
-        &String::from_str(&env, "Inheritance Plan"),
-        &1000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Will",
+        "Inheritance Plan",
+        1000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries,
-    );
+    ));
 
     client.claim_inheritance_plan(
         &plan_id,
@@ -619,12 +696,7 @@ fn test_double_claim_fails() {
 #[should_panic]
 fn test_claim_with_wrong_code_fails() {
     let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
-
-    let owner = Address::generate(&env);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
     let beneficiaries = vec![
         &env,
@@ -637,14 +709,16 @@ fn test_claim_with_wrong_code_fails() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Will"),
-        &String::from_str(&env, "Inheritance Plan"),
-        &1000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Will",
+        "Inheritance Plan",
+        1000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries,
-    );
+    ));
 
     client.claim_inheritance_plan(
         &plan_id,
@@ -656,13 +730,8 @@ fn test_claim_with_wrong_code_fails() {
 #[test]
 fn test_deactivate_plan_success() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
-
-    // Create a plan
     let beneficiaries_data = vec![
         &env,
         (
@@ -674,14 +743,16 @@ fn test_deactivate_plan_success() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Deactivate the plan
     let result = client.try_deactivate_inheritance_plan(&owner, &plan_id);
@@ -691,14 +762,9 @@ fn test_deactivate_plan_success() {
 #[test]
 fn test_deactivate_plan_unauthorized() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
-
-    let owner = create_test_address(&env, 1);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
     let unauthorized = create_test_address(&env, 2);
 
-    // Create a plan
     let beneficiaries_data = vec![
         &env,
         (
@@ -710,14 +776,16 @@ fn test_deactivate_plan_unauthorized() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Try to deactivate with unauthorized address
     let result = client.try_deactivate_inheritance_plan(&unauthorized, &plan_id);
@@ -741,13 +809,8 @@ fn test_deactivate_plan_not_found() {
 #[test]
 fn test_deactivate_plan_already_deactivated() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
-
-    // Create a plan
     let beneficiaries_data = vec![
         &env,
         (
@@ -759,14 +822,16 @@ fn test_deactivate_plan_already_deactivated() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Deactivate the plan
     client.deactivate_inheritance_plan(&owner, &plan_id);
@@ -780,13 +845,8 @@ fn test_deactivate_plan_already_deactivated() {
 #[should_panic]
 fn test_claim_deactivated_plan_fails() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
-
-    // Create a plan
     let beneficiaries_data = vec![
         &env,
         (
@@ -798,14 +858,16 @@ fn test_claim_deactivated_plan_fails() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Deactivate the plan
     client.deactivate_inheritance_plan(&owner, &plan_id);
@@ -821,13 +883,8 @@ fn test_claim_deactivated_plan_fails() {
 #[test]
 fn test_deactivate_plan_with_multiple_beneficiaries() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
-
-    // Create a plan with multiple beneficiaries
     let beneficiaries_data = vec![
         &env,
         (
@@ -846,14 +903,16 @@ fn test_deactivate_plan_with_multiple_beneficiaries() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &2000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        2000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Deactivate the plan
     let result = client.try_deactivate_inheritance_plan(&owner, &plan_id);
@@ -863,13 +922,8 @@ fn test_deactivate_plan_with_multiple_beneficiaries() {
 #[test]
 fn test_get_plan_details() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
-
-    // Create a plan
     let beneficiaries_data = vec![
         &env,
         (
@@ -881,22 +935,24 @@ fn test_get_plan_details() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Test Plan"),
-        &String::from_str(&env, "Test Description"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Test Plan",
+        "Test Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
-    // Get plan details
+    // Get plan details — plan stores net amount (user input minus 2% fee): 1000000 * 0.98 = 980000
     let plan = client.get_plan_details(&plan_id);
     assert!(plan.is_some());
 
     let plan_data = plan.unwrap();
     assert!(plan_data.is_active);
-    assert_eq!(plan_data.total_amount, 1000000u64);
+    assert_eq!(plan_data.total_amount, 980000u64);
 
     // Deactivate and check again
     client.deactivate_inheritance_plan(&owner, &plan_id);
@@ -904,6 +960,158 @@ fn test_get_plan_details() {
     let deactivated_plan = client.get_plan_details(&plan_id);
     assert!(deactivated_plan.is_some());
     assert!(!deactivated_plan.unwrap().is_active);
+}
+
+// --- 2% creation fee: unit and integration tests ---
+
+#[test]
+fn test_creation_fee_calculation_and_net_amount_stored() {
+    let env = Env::default();
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
+
+    // User input 100_000; 2% fee = 2_000, net = 98_000
+    let input_amount = 100_000u64;
+    let beneficiaries_data = default_beneficiaries(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Fee Test Plan",
+        "Description",
+        input_amount,
+        DistributionMethod::LumpSum,
+        &beneficiaries_data,
+    ));
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    let expected_fee = input_amount * 2 / 100;
+    let expected_net = input_amount - expected_fee;
+    assert_eq!(
+        plan.total_amount, expected_net,
+        "Plan must store net amount (input minus 2% fee)"
+    );
+    assert_eq!(expected_net, 98_000u64);
+}
+
+#[test]
+fn test_fee_transfer_to_admin_wallet() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let input_amount = 1000u64; // fee = 20
+    let beneficiaries_data = default_beneficiaries(&env);
+
+    let admin_balance_before = TestTokenHelper::new(&env, &token).balance(&admin);
+
+    client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Plan",
+        "Desc",
+        input_amount,
+        DistributionMethod::LumpSum,
+        &beneficiaries_data,
+    ));
+
+    let admin_balance_after = TestTokenHelper::new(&env, &token).balance(&admin);
+    let expected_fee = 20i128; // 2% of 1000
+    assert_eq!(
+        admin_balance_after - admin_balance_before,
+        expected_fee,
+        "Admin must receive 2% fee"
+    );
+}
+
+#[test]
+fn test_insufficient_balance_returns_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, InheritanceContract);
+    let token_id = env.register_contract(None, MockToken);
+    let admin = create_test_address(&env, 100);
+    let owner = create_test_address(&env, 1);
+
+    InheritanceContractClient::new(&env, &contract_id).initialize_admin(&admin);
+    // Mint only 100 to owner (less than 1000 needed)
+    TestTokenHelper::new(&env, &token_id).mint(&owner, &100i128);
+
+    let client = InheritanceContractClient::new(&env, &contract_id);
+    let beneficiaries_data = default_beneficiaries(&env);
+
+    let result = client.try_create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token_id,
+        "Plan",
+        "Desc",
+        1000u64,
+        DistributionMethod::LumpSum,
+        &beneficiaries_data,
+    ));
+
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.is_ok(),
+        "contract should return InheritanceError, not InvokeError"
+    );
+    assert_eq!(err.ok().unwrap(), InheritanceError::InsufficientBalance);
+}
+
+#[test]
+fn test_create_plan_without_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, InheritanceContract);
+    let token_id = env.register_contract(None, MockToken);
+    let owner = create_test_address(&env, 1);
+    TestTokenHelper::new(&env, &token_id).mint(&owner, &10_000_000i128);
+
+    let client = InheritanceContractClient::new(&env, &contract_id);
+    // Do NOT call initialize_admin
+
+    let result = client.try_create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token_id,
+        "Plan",
+        "Desc",
+        1000u64,
+        DistributionMethod::LumpSum,
+        &default_beneficiaries(&env),
+    ));
+
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(
+        err.is_ok(),
+        "contract should return InheritanceError, not InvokeError"
+    );
+    assert_eq!(err.ok().unwrap(), InheritanceError::AdminNotSet);
+}
+
+#[test]
+fn test_successful_plan_creation_with_net_amount() {
+    let env = Env::default();
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
+
+    let input = 50_000u64;
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "My Plan",
+        "Desc",
+        input,
+        DistributionMethod::LumpSum,
+        &default_beneficiaries(&env),
+    ));
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_amount, 49_000u64); // 50_000 - 2% = 49_000
+    assert!(plan.is_active);
 }
 
 #[test]
@@ -1191,11 +1399,12 @@ fn test_plan_data_survives_across_versions() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, InheritanceContract);
+    let token_id = env.register_contract(None, MockToken);
     let client = InheritanceContractClient::new(&env, &contract_id);
-
     let admin = create_test_address(&env, 1);
     let owner = create_test_address(&env, 2);
     client.initialize_admin(&admin);
+    TestTokenHelper::new(&env, &token_id).mint(&owner, &10_000_000i128);
 
     // Create plans, claims, KYC before version bump
     let beneficiaries_data = vec![
@@ -1216,24 +1425,28 @@ fn test_plan_data_survives_across_versions() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Pre-Upgrade Plan"),
-        &String::from_str(&env, "Should survive"),
-        &5000000u64,
-        &DistributionMethod::LumpSum,
+        &token_id,
+        "Pre-Upgrade Plan",
+        "Should survive",
+        5000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Deactivate second plan
-    let deact_id = client.create_inheritance_plan(
+    let deact_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Deactivated"),
-        &String::from_str(&env, "Will deactivate"),
-        &2000000u64,
-        &DistributionMethod::Monthly,
-        &beneficiaries_data.clone(),
-    );
+        &token_id,
+        "Deactivated",
+        "Will deactivate",
+        2000000u64,
+        DistributionMethod::Monthly,
+        &beneficiaries_data,
+    ));
     client.deactivate_inheritance_plan(&owner, &deact_id);
 
     // Submit + approve KYC
@@ -1246,10 +1459,10 @@ fn test_plan_data_survives_across_versions() {
         env.storage().instance().set(&DataKey::Version, &2u32);
     });
 
-    // All data still accessible
+    // All data still accessible (plan stores net amount after 2% fee: 5000000 * 0.98 = 4900000)
     let plan = client.get_plan_details(&plan_id).unwrap();
     assert!(plan.is_active);
-    assert_eq!(plan.total_amount, 5000000u64);
+    assert_eq!(plan.total_amount, 4_900_000u64);
     assert_eq!(plan.beneficiaries.len(), 2);
     assert_eq!(plan.owner, owner);
 
@@ -1268,11 +1481,8 @@ fn test_plan_data_survives_across_versions() {
 #[test]
 fn test_get_user_deactivated_plans() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
     let beneficiaries_data = vec![
         &env,
         (
@@ -1285,22 +1495,26 @@ fn test_get_user_deactivated_plans() {
     ];
 
     // Create 2 plans
-    let plan1 = client.create_inheritance_plan(
+    let plan1 = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Plan 1"),
-        &String::from_str(&env, "Desc 1"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Plan 1",
+        "Desc 1",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
-    let _plan2 = client.create_inheritance_plan(
+    ));
+    let _plan2 = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Plan 2"),
-        &String::from_str(&env, "Desc 2"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Plan 2",
+        "Desc 2",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
 
     // Deactivate plan 1
     client.deactivate_inheritance_plan(&owner, &plan1);
@@ -1317,15 +1531,12 @@ fn test_get_user_deactivated_plans() {
 #[test]
 fn test_admin_retrieval() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
-
-    let admin = create_test_address(&env, 99);
-    client.initialize_admin(&admin);
-
+    let (client, token, admin, _) = setup_with_token_and_admin(&env);
     let owner1 = create_test_address(&env, 1);
     let owner2 = create_test_address(&env, 2);
+    TestTokenHelper::new(&env, &token).mint(&owner1, &10_000_000i128);
+    TestTokenHelper::new(&env, &token).mint(&owner2, &10_000_000i128);
+
     let beneficiaries_data = vec![
         &env,
         (
@@ -1338,25 +1549,29 @@ fn test_admin_retrieval() {
     ];
 
     // Owner 1 creates and deactivates
-    let plan1 = client.create_inheritance_plan(
+    let plan1 = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner1,
-        &String::from_str(&env, "Plan 1"),
-        &String::from_str(&env, "Desc 1"),
-        &1000000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Plan 1",
+        "Desc 1",
+        1000000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
     client.deactivate_inheritance_plan(&owner1, &plan1);
 
     // Owner 2 creates and deactivates
-    let plan2 = client.create_inheritance_plan(
+    let plan2 = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner2,
-        &String::from_str(&env, "Plan 2"),
-        &String::from_str(&env, "Desc 2"),
-        &1000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Plan 2",
+        "Desc 2",
+        1000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries_data,
-    );
+    ));
     client.deactivate_inheritance_plan(&owner2, &plan2);
 
     // Admin retrieves all
@@ -1367,11 +1582,8 @@ fn test_admin_retrieval() {
 #[test]
 fn test_get_claimed_plan() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
     let beneficiaries = vec![
         &env,
         (
@@ -1383,14 +1595,16 @@ fn test_get_claimed_plan() {
         ),
     ];
 
-    let plan_id = client.create_inheritance_plan(
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Will"),
-        &String::from_str(&env, "Inheritance Plan"),
-        &1000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Will",
+        "Inheritance Plan",
+        1000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries,
-    );
+    ));
 
     // Should error because it's not claimed yet
     let result = client.try_get_claimed_plan(&owner, &plan_id);
@@ -1402,19 +1616,17 @@ fn test_get_claimed_plan() {
         &123456u32,
     );
 
-    // Should succeed now
+    // Should succeed now (plan stores net after 2% fee: 1000 * 0.98 = 980)
+    // After 100% claim, the remaining balance should be 0.
     let plan = client.get_claimed_plan(&owner, &plan_id);
-    assert_eq!(plan.total_amount, 1000u64);
+    assert_eq!(plan.total_amount, 0u64);
 }
 
 #[test]
 fn test_get_user_claimed_plans() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
 
-    let owner = create_test_address(&env, 1);
     let beneficiaries = vec![
         &env,
         (
@@ -1426,23 +1638,27 @@ fn test_get_user_claimed_plans() {
         ),
     ];
 
-    let plan1 = client.create_inheritance_plan(
+    let plan1 = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Will 1"),
-        &String::from_str(&env, "Plan"),
-        &1000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Will 1",
+        "Plan",
+        1000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries,
-    );
+    ));
 
-    let plan2 = client.create_inheritance_plan(
+    let plan2 = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Will 2"),
-        &String::from_str(&env, "Plan"),
-        &2000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Will 2",
+        "Plan",
+        2000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries,
-    );
+    ));
 
     client.claim_inheritance_plan(
         &plan1,
@@ -1462,14 +1678,8 @@ fn test_get_user_claimed_plans() {
 #[test]
 fn test_get_all_claimed_plans() {
     let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, InheritanceContract);
-    let client = InheritanceContractClient::new(&env, &contract_id);
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
 
-    let admin = create_test_address(&env, 99);
-    client.initialize_admin(&admin);
-
-    let owner = create_test_address(&env, 1);
     let beneficiaries = vec![
         &env,
         (
@@ -1481,14 +1691,16 @@ fn test_get_all_claimed_plans() {
         ),
     ];
 
-    let plan1 = client.create_inheritance_plan(
+    let plan1 = client.create_inheritance_plan(&plan_params(
+        &env,
         &owner,
-        &String::from_str(&env, "Will"),
-        &String::from_str(&env, "Plan"),
-        &1000u64,
-        &DistributionMethod::LumpSum,
+        &token,
+        "Will",
+        "Plan",
+        1000u64,
+        DistributionMethod::LumpSum,
         &beneficiaries,
-    );
+    ));
 
     client.claim_inheritance_plan(
         &plan1,
@@ -1502,4 +1714,851 @@ fn test_get_all_claimed_plans() {
     let non_admin = create_test_address(&env, 2);
     let result = client.try_get_all_claimed_plans(&non_admin);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_get_user_plan_supports_active_and_inactive() {
+    let env = Env::default();
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
+    let stranger = create_test_address(&env, 2);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Plan A",
+        "Plan A Description",
+        1000000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice1@example.com", 123456),
+    ));
+
+    let active_plan = client.get_user_plan(&owner, &plan_id);
+    assert!(active_plan.is_active);
+
+    client.deactivate_inheritance_plan(&owner, &plan_id);
+    let inactive_plan = client.get_user_plan(&owner, &plan_id);
+    assert!(!inactive_plan.is_active);
+
+    let unauthorized = client.try_get_user_plan(&stranger, &plan_id);
+    assert!(unauthorized.is_err());
+}
+
+#[test]
+fn test_get_user_plans_returns_all_user_plans() {
+    let env = Env::default();
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_1 = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Plan 1",
+        "Description 1",
+        1000000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice2@example.com", 111111),
+    ));
+
+    let _plan_2 = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Plan 2",
+        "Description 2",
+        2000000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Bob", "bob2@example.com", 222222),
+    ));
+
+    client.deactivate_inheritance_plan(&owner, &plan_1);
+
+    let plans = client.get_user_plans(&owner);
+    assert_eq!(plans.len(), 2);
+}
+
+#[test]
+fn test_get_all_plans_admin_only_and_includes_active_inactive() {
+    let env = Env::default();
+    let (client, token, admin, _) = setup_with_token_and_admin(&env);
+    let user_a = create_test_address(&env, 1);
+    let user_b = create_test_address(&env, 2);
+    TestTokenHelper::new(&env, &token).mint(&user_a, &10_000_000i128);
+    TestTokenHelper::new(&env, &token).mint(&user_b, &10_000_000i128);
+
+    let plan_a1 = client.create_inheritance_plan(&plan_params(
+        &env,
+        &user_a,
+        &token,
+        "A1",
+        "A1 Desc",
+        1000000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "A", "a1@example.com", 100001),
+    ));
+
+    let _plan_a2 = client.create_inheritance_plan(&plan_params(
+        &env,
+        &user_a,
+        &token,
+        "A2",
+        "A2 Desc",
+        2000000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "A", "a2@example.com", 100002),
+    ));
+
+    let _plan_b1 = client.create_inheritance_plan(&plan_params(
+        &env,
+        &user_b,
+        &token,
+        "B1",
+        "B1 Desc",
+        3000000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "B", "b1@example.com", 100003),
+    ));
+
+    client.deactivate_inheritance_plan(&user_a, &plan_a1);
+
+    let all_plans = client.get_all_plans(&admin);
+    assert_eq!(all_plans.len(), 3);
+
+    let non_admin = create_test_address(&env, 999);
+    let unauthorized = client.try_get_all_plans(&non_admin);
+    assert!(unauthorized.is_err());
+}
+
+#[test]
+fn test_get_user_pending_plans_filters_only_active() {
+    let env = Env::default();
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_1 = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Plan 1",
+        "Description 1",
+        1000000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice3@example.com", 333333),
+    ));
+
+    let _plan_2 = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Plan 2",
+        "Description 2",
+        2000000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Bob", "bob3@example.com", 444444),
+    ));
+
+    client.deactivate_inheritance_plan(&owner, &plan_1);
+
+    let pending = client.get_user_pending_plans(&owner);
+    assert_eq!(pending.len(), 1);
+    assert!(pending.get(0).unwrap().is_active);
+}
+
+#[test]
+fn test_get_all_pending_plans_admin_only() {
+    let env = Env::default();
+    let (client, token, admin, _) = setup_with_token_and_admin(&env);
+    let user_a = create_test_address(&env, 1);
+    let user_b = create_test_address(&env, 2);
+    TestTokenHelper::new(&env, &token).mint(&user_a, &10_000_000i128);
+    TestTokenHelper::new(&env, &token).mint(&user_b, &10_000_000i128);
+
+    let plan_a = client.create_inheritance_plan(&plan_params(
+        &env,
+        &user_a,
+        &token,
+        "A",
+        "A Desc",
+        1000000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "A", "a3@example.com", 555555),
+    ));
+
+    let _plan_b = client.create_inheritance_plan(&plan_params(
+        &env,
+        &user_b,
+        &token,
+        "B",
+        "B Desc",
+        2000000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "B", "b3@example.com", 666666),
+    ));
+
+    client.deactivate_inheritance_plan(&user_a, &plan_a);
+
+    let pending = client.get_all_pending_plans(&admin);
+    assert_eq!(pending.len(), 1);
+    assert!(pending.get(0).unwrap().is_active);
+
+    let not_admin = create_test_address(&env, 999);
+    let unauthorized = client.try_get_all_pending_plans(&not_admin);
+    assert!(unauthorized.is_err());
+}
+
+// ───────────────────────────────────────────────────
+// Lending Features Tests
+// ───────────────────────────────────────────────────
+
+#[test]
+fn test_set_lendable() {
+    let env = Env::default();
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Lend",
+        "Test Lend",
+        1000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "B", "b@example.com", 666666),
+    ));
+
+    // Initially lendable defaults to true based on our plan_params modification
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert!(plan.is_lendable);
+
+    // Toggle off
+    client.set_lendable(&owner, &plan_id, &false);
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert!(!plan.is_lendable);
+
+    // Unauthorized fails
+    let not_owner = create_test_address(&env, 999);
+    let result = client.try_set_lendable(&not_owner, &plan_id, &true);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_vault_deposit_and_withdraw() {
+    let env = Env::default();
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
+    TestTokenHelper::new(&env, &token).mint(&owner, &10_000_000i128);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Lend",
+        "Test Lend",
+        1000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "B", "b@example.com", 666666),
+    ));
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_amount, 980); // 1000 - 2% fee
+
+    // Deposit more
+    client.deposit(&owner, &token, &plan_id, &500u64);
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_amount, 1480);
+
+    // Withdraw some
+    client.withdraw(&owner, &token, &plan_id, &300u64);
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_amount, 1180);
+    assert_eq!(plan.total_loaned, 0);
+
+    // Unauthorized fails
+    let not_owner = create_test_address(&env, 999);
+    let result = client.try_deposit(&not_owner, &token, &plan_id, &100u64);
+    assert!(result.is_err());
+    let result = client.try_withdraw(&not_owner, &token, &plan_id, &100u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_vault_withdraw_prevents_over_withdrawal() {
+    let env = Env::default();
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
+    TestTokenHelper::new(&env, &token).mint(&owner, &10_000_000i128);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Lend",
+        "Test Lend",
+        1000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "B", "b@example.com", 666666),
+    ));
+
+    client.deposit(&owner, &token, &plan_id, &500u64);
+
+    // We don't have a public function to change total_loaned from the client (since
+    // it's for external protocols), so we simulate it by setting it in storage.
+    let mut plan = client.get_plan_details(&plan_id).unwrap();
+    plan.total_loaned = 1000;
+
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plan(plan_id), &plan);
+    });
+
+    let modified_plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(modified_plan.total_amount, 1480);
+    assert_eq!(modified_plan.total_loaned, 1000);
+
+    // Withdraw 400 OK (1480 - 1000 = 480 available)
+    assert!(client
+        .try_withdraw(&owner, &token, &plan_id, &400u64)
+        .is_ok());
+
+    // Another 100 FAILS (480 - 400 = 80 available)
+    let err = client.try_withdraw(&owner, &token, &plan_id, &100u64);
+    assert!(err.is_err());
+}
+
+// ───────────────────────────────────────────────────
+// Loan Recall on Inheritance Trigger Tests
+// ───────────────────────────────────────────────────
+
+#[test]
+fn test_trigger_inheritance_freezes_loans() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    // Plan should be lendable initially
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert!(plan.is_lendable);
+
+    // Trigger inheritance
+    client.trigger_inheritance(&admin, &plan_id);
+
+    // Plan should now have is_lendable = false (loans frozen)
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert!(!plan.is_lendable);
+
+    // Trigger info should exist
+    let trigger_info = client.get_inheritance_trigger(&plan_id);
+    assert!(trigger_info.is_some());
+    let info = trigger_info.unwrap();
+    assert!(info.loan_freeze_active);
+    assert!(!info.recall_attempted);
+    assert!(!info.liquidation_triggered);
+}
+
+#[test]
+fn test_trigger_inheritance_double_trigger_fails() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    client.trigger_inheritance(&admin, &plan_id);
+
+    // Second trigger should fail
+    let result = client.try_trigger_inheritance(&admin, &plan_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_trigger_inheritance_non_admin_fails() {
+    let env = Env::default();
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    let non_admin = create_test_address(&env, 999);
+    let result = client.try_trigger_inheritance(&non_admin, &plan_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_trigger_inheritance_inactive_plan_fails() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    // Deactivate first
+    client.deactivate_inheritance_plan(&owner, &plan_id);
+
+    let result = client.try_trigger_inheritance(&admin, &plan_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_recall_loan_success() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    // Simulate outstanding loans by setting total_loaned
+    let mut plan = client.get_plan_details(&plan_id).unwrap();
+    plan.total_loaned = 50_000;
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plan(plan_id), &plan);
+    });
+
+    // Trigger inheritance
+    client.trigger_inheritance(&admin, &plan_id);
+
+    // Recall 30,000 of the 50,000 loaned
+    client.recall_loan(&admin, &plan_id, &30_000u64);
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_loaned, 20_000);
+
+    let info = client.get_inheritance_trigger(&plan_id).unwrap();
+    assert!(info.recall_attempted);
+    assert_eq!(info.recalled_amount, 30_000);
+
+    // Recall remaining
+    client.recall_loan(&admin, &plan_id, &20_000u64);
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_loaned, 0);
+
+    let info = client.get_inheritance_trigger(&plan_id).unwrap();
+    assert_eq!(info.recalled_amount, 50_000);
+}
+
+#[test]
+fn test_recall_loan_exceeds_loaned_fails() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    let mut plan = client.get_plan_details(&plan_id).unwrap();
+    plan.total_loaned = 10_000;
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plan(plan_id), &plan);
+    });
+
+    client.trigger_inheritance(&admin, &plan_id);
+
+    // Recall more than loaned should fail
+    let result = client.try_recall_loan(&admin, &plan_id, &20_000u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_recall_loan_without_trigger_fails() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    // Try to recall without triggering inheritance first
+    let result = client.try_recall_loan(&admin, &plan_id, &1000u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_recall_loan_no_outstanding_loans_fails() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    client.trigger_inheritance(&admin, &plan_id);
+
+    // No loans to recall
+    let result = client.try_recall_loan(&admin, &plan_id, &1000u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_liquidation_fallback_success() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    // Plan stores 98,000 (100,000 - 2% fee)
+    // Simulate 30,000 in loans
+    let mut plan = client.get_plan_details(&plan_id).unwrap();
+    plan.total_loaned = 30_000;
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plan(plan_id), &plan);
+    });
+
+    // Trigger inheritance
+    client.trigger_inheritance(&admin, &plan_id);
+
+    // Trigger liquidation fallback — write off 30,000
+    client.liquidation_fallback(&admin, &plan_id);
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_loaned, 0);
+    // 98,000 - 30,000 = 68,000 claimable
+    assert_eq!(plan.total_amount, 68_000);
+
+    let info = client.get_inheritance_trigger(&plan_id).unwrap();
+    assert!(info.liquidation_triggered);
+    assert_eq!(info.settled_amount, 30_000);
+}
+
+#[test]
+fn test_liquidation_fallback_without_trigger_fails() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    let result = client.try_liquidation_fallback(&admin, &plan_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_liquidation_fallback_no_loans_fails() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    client.trigger_inheritance(&admin, &plan_id);
+
+    // No loans to liquidate
+    let result = client.try_liquidation_fallback(&admin, &plan_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_partial_recall_then_liquidation_fallback() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    // Plan stores 98,000, simulate 40,000 in loans
+    let mut plan = client.get_plan_details(&plan_id).unwrap();
+    plan.total_loaned = 40_000;
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plan(plan_id), &plan);
+    });
+
+    client.trigger_inheritance(&admin, &plan_id);
+
+    // Recall 25,000 of 40,000
+    client.recall_loan(&admin, &plan_id, &25_000u64);
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_loaned, 15_000);
+
+    // Liquidation fallback for remaining 15,000
+    client.liquidation_fallback(&admin, &plan_id);
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_loaned, 0);
+    // 98,000 - 15,000 = 83,000 claimable
+    assert_eq!(plan.total_amount, 83_000);
+
+    let info = client.get_inheritance_trigger(&plan_id).unwrap();
+    assert!(info.recall_attempted);
+    assert!(info.liquidation_triggered);
+    assert_eq!(info.recalled_amount, 25_000);
+    assert_eq!(info.settled_amount, 15_000);
+}
+
+#[test]
+fn test_inheritance_claim_not_blocked_by_loans() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    // Simulate outstanding loans
+    let mut plan = client.get_plan_details(&plan_id).unwrap();
+    plan.total_loaned = 50_000;
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plan(plan_id), &plan);
+    });
+
+    // Trigger inheritance
+    client.trigger_inheritance(&admin, &plan_id);
+
+    // Claim should succeed even with outstanding loans
+    client.claim_inheritance_plan(
+        &plan_id,
+        &String::from_str(&env, "alice@example.com"),
+        &123456u32,
+    );
+
+    // After claiming, total_amount is reduced by base_payout so claimable is 0
+    let claimable = client.get_claimable_amount(&plan_id);
+    assert_eq!(claimable, 0);
+}
+
+#[test]
+fn test_inheritance_claim_bypasses_time_check_when_triggered() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    // Create plan with Yearly distribution (would normally need 365 days)
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::Yearly,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    // Without trigger, claim should fail (time not met)
+    let result = client.try_claim_inheritance_plan(
+        &plan_id,
+        &String::from_str(&env, "alice@example.com"),
+        &123456u32,
+    );
+    assert!(result.is_err());
+
+    // Trigger inheritance
+    client.trigger_inheritance(&admin, &plan_id);
+
+    // Now claim should succeed despite time not elapsed
+    client.claim_inheritance_plan(
+        &plan_id,
+        &String::from_str(&env, "alice@example.com"),
+        &123456u32,
+    );
+}
+
+#[test]
+fn test_get_claimable_amount() {
+    let env = Env::default();
+    let (client, token, _admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    // No loans — full amount claimable (98,000 after 2% fee)
+    let claimable = client.get_claimable_amount(&plan_id);
+    assert_eq!(claimable, 98_000);
+
+    // Simulate loans
+    let mut plan = client.get_plan_details(&plan_id).unwrap();
+    plan.total_loaned = 20_000;
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plan(plan_id), &plan);
+    });
+
+    let claimable = client.get_claimable_amount(&plan_id);
+    assert_eq!(claimable, 78_000);
+}
+
+#[test]
+fn test_full_loan_recall_workflow() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    // Step 1: Create plan
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Estate",
+        "Full estate plan",
+        500_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    // Plan stores 490,000 (500k - 2% fee)
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_amount, 490_000);
+    assert!(plan.is_lendable);
+
+    // Step 2: Simulate some funds being loaned out
+    let mut plan = client.get_plan_details(&plan_id).unwrap();
+    plan.total_loaned = 200_000;
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Plan(plan_id), &plan);
+    });
+
+    // Step 3: Trigger inheritance — freezes new loans
+    client.trigger_inheritance(&admin, &plan_id);
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert!(!plan.is_lendable); // Frozen
+
+    // Step 4: Attempt recall — recover 150k of 200k
+    client.recall_loan(&admin, &plan_id, &150_000u64);
+
+    // Step 5: Liquidation fallback for remaining 50k
+    client.liquidation_fallback(&admin, &plan_id);
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(plan.total_loaned, 0);
+    // 490,000 - 50,000 = 440,000 (only unrecoverable 50k was written off)
+    assert_eq!(plan.total_amount, 440_000);
+
+    // Step 6: Beneficiary claims
+    client.claim_inheritance_plan(
+        &plan_id,
+        &String::from_str(&env, "alice@example.com"),
+        &123456u32,
+    );
+
+    // After claiming, total_amount is reduced by base_payout so claimable is 0
+    let claimable = client.get_claimable_amount(&plan_id);
+    assert_eq!(claimable, 0);
+
+    // Verify full trigger info
+    let info = client.get_inheritance_trigger(&plan_id).unwrap();
+    assert!(info.loan_freeze_active);
+    assert!(info.recall_attempted);
+    assert!(info.liquidation_triggered);
+    assert_eq!(info.original_loaned, 200_000);
+    assert_eq!(info.recalled_amount, 150_000);
+    assert_eq!(info.settled_amount, 50_000);
 }

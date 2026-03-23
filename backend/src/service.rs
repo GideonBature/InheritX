@@ -1,4 +1,19 @@
+// Notification stubs
+pub fn notify_plan_created(_user_id: uuid::Uuid, _plan_id: uuid::Uuid) {
+    // TODO: Implement email or in-app notification for plan creation
+}
+
+pub fn notify_plan_claimed(_user_id: uuid::Uuid, _plan_id: uuid::Uuid) {
+    // TODO: Implement email or in-app notification for plan claim
+}
+
+pub fn notify_plan_deactivated(_user_id: uuid::Uuid, _plan_id: uuid::Uuid) {
+    // TODO: Implement email or in-app notification for plan deactivation
+}
 use crate::api_error::ApiError;
+use crate::notifications::{
+    audit_action, entity_type, notif_type, AuditLogService, NotificationService,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -84,7 +99,7 @@ pub struct PlanWithBeneficiary {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct CreatePlanRequest {
     pub title: String,
     pub description: Option<String>,
@@ -94,13 +109,13 @@ pub struct CreatePlanRequest {
     pub bank_account_number: Option<String>,
     pub bank_name: Option<String>,
     pub currency_preference: String,
+    pub two_fa_code: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ClaimPlanRequest {
     pub beneficiary_email: String,
-    #[allow(dead_code)]
-    pub claim_code: Option<u32>,
+    pub two_fa_code: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -186,10 +201,17 @@ impl PlanService {
     }
 
     pub async fn create_plan(
-        db: &PgPool,
+        pool: &PgPool,
         user_id: Uuid,
         req: &CreatePlanRequest,
     ) -> Result<PlanWithBeneficiary, ApiError> {
+        // 1. Validate input amounts
+        crate::safe_math::SafeMath::ensure_non_negative(req.fee, "fee")?;
+        crate::safe_math::SafeMath::ensure_non_negative(req.net_amount, "net_amount")?;
+
+        // 2. Start Transaction
+        let mut tx = pool.begin().await?;
+
         let currency = CurrencyPreference::from_str(req.currency_preference.trim())?;
         Self::validate_beneficiary_for_currency(
             &currency,
@@ -209,18 +231,19 @@ impl PlanService {
             .map(|s| s.trim().to_string());
         let currency_preference = Some(currency.as_str().to_string());
 
+        // 2. Insert Plan - using the transaction handle
         let row = sqlx::query_as::<_, PlanRowFull>(
             r#"
-            INSERT INTO plans (
-                user_id, title, description, fee, net_amount, status,
-                beneficiary_name, bank_account_number, bank_name, currency_preference
-            )
-            VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9)
-            RETURNING id, user_id, title, description, fee, net_amount, status,
-                      contract_plan_id, distribution_method, is_active, contract_created_at,
-                      beneficiary_name, bank_account_number, bank_name, currency_preference,
-                      created_at, updated_at
-            "#,
+        INSERT INTO plans (
+            user_id, title, description, fee, net_amount, status,
+            beneficiary_name, bank_account_number, bank_name, currency_preference
+        )
+        VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9)
+        RETURNING id, user_id, title, description, fee, net_amount, status,
+                  contract_plan_id, distribution_method, is_active, contract_created_at,
+                  beneficiary_name, bank_account_number, bank_name, currency_preference,
+                  created_at, updated_at
+        "#,
         )
         .bind(user_id)
         .bind(&req.title)
@@ -231,30 +254,47 @@ impl PlanService {
         .bind(&bank_account_number)
         .bind(&bank_name)
         .bind(&currency_preference)
-        .fetch_one(db)
+        .fetch_one(&mut *tx) // CRITICAL: Use the transaction, not the pool
         .await?;
 
-        plan_row_to_plan_with_beneficiary(&row)
-    }
+        let plan = plan_row_to_plan_with_beneficiary(&row)?;
 
-    pub async fn get_plan_by_id(
-        db: &PgPool,
+        // 3. Audit: This must now return Result and use the transaction
+        AuditLogService::log(
+            &mut *tx, // Pass the transaction
+            Some(user_id),
+            audit_action::PLAN_CREATED,
+            Some(plan.id),
+            Some(entity_type::PLAN),
+        )
+        .await?; // If this fails, '?' triggers an early return
+
+        // 4. Commit: If we reached here, both Plan and Audit are saved
+        tx.commit().await?;
+
+        Ok(plan)
+    }
+    pub async fn get_plan_by_id<'a, E>(
+        executor: E,
         plan_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<PlanWithBeneficiary>, ApiError> {
+    ) -> Result<Option<PlanWithBeneficiary>, ApiError>
+    where
+        E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+    {
         let row = sqlx::query_as::<_, PlanRowFull>(
             r#"
-            SELECT id, user_id, title, description, fee, net_amount, status,
-                   contract_plan_id, distribution_method, is_active, contract_created_at,
-                   beneficiary_name, bank_account_number, bank_name, currency_preference,
-                   created_at, updated_at
-            FROM plans
-            WHERE id = $1 AND user_id = $2
-            "#,
+        SELECT id, user_id, title, description, fee, net_amount, status,
+               contract_plan_id, distribution_method, is_active, contract_created_at,
+               beneficiary_name, bank_account_number, bank_name, currency_preference,
+               created_at, updated_at
+        FROM plans
+        WHERE id = $1 AND user_id = $2
+        "#,
         )
         .bind(plan_id)
         .bind(user_id)
-        .fetch_optional(db)
+        .fetch_optional(executor)
         .await?;
 
         match row {
@@ -263,18 +303,96 @@ impl PlanService {
         }
     }
 
+    pub async fn get_plan_by_id_any_user<'a, E>(
+        executor: E,
+        plan_id: Uuid,
+    ) -> Result<Option<PlanWithBeneficiary>, ApiError>
+    where
+        E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+    {
+        let row = sqlx::query_as::<_, PlanRowFull>(
+            r#"
+        SELECT id, user_id, title, description, fee, net_amount, status,
+               contract_plan_id, distribution_method, is_active, contract_created_at,
+               beneficiary_name, bank_account_number, bank_name, currency_preference,
+               created_at, updated_at
+        FROM plans
+        WHERE id = $1
+        "#,
+        )
+        .bind(plan_id)
+        .fetch_optional(executor)
+        .await?;
+
+        match row {
+            Some(r) => Ok(Some(plan_row_to_plan_with_beneficiary(&r)?)),
+            None => Ok(None),
+        }
+    }
     pub async fn claim_plan(
-        db: &PgPool,
+        pool: &PgPool,
         plan_id: Uuid,
         user_id: Uuid,
         req: &ClaimPlanRequest,
     ) -> Result<PlanWithBeneficiary, ApiError> {
-        let plan = Self::get_plan_by_id(db, plan_id, user_id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("Plan {} not found", plan_id)))?;
+        // 1. Start the transaction
+        let mut tx = pool.begin().await?;
+
+        // 2. Use SELECT FOR UPDATE to lock the plan row and prevent concurrent claims
+        let row = sqlx::query_as::<_, PlanRowFull>(
+            r#"
+            SELECT id, user_id, title, description, fee, net_amount, status,
+                   contract_plan_id, distribution_method, is_active, contract_created_at,
+                   beneficiary_name, bank_account_number, bank_name, currency_preference,
+                   created_at, updated_at
+            FROM plans
+            WHERE id = $1 AND user_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(plan_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let plan = match row {
+            Some(r) => plan_row_to_plan_with_beneficiary(&r)?,
+            None => return Err(ApiError::NotFound(format!("Plan {} not found", plan_id))),
+        };
+
+        // Check if plan is paused
+        let is_paused: Option<bool> =
+            sqlx::query_scalar("SELECT is_paused FROM plans WHERE id = $1")
+                .bind(plan_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        if is_paused == Some(true) {
+            return Err(ApiError::BadRequest(
+                "This plan is currently paused by an administrator and cannot be claimed"
+                    .to_string(),
+            ));
+        }
+
+        // Check if plan is already claimed - this prevents concurrent claims
+        if plan.status == "claimed" {
+            return Err(ApiError::BadRequest(
+                "This plan has already been claimed".to_string(),
+            ));
+        }
+
+        if !Self::is_due_for_claim(
+            plan.distribution_method.as_deref(),
+            plan.contract_created_at,
+        ) {
+            return Err(ApiError::BadRequest(
+                "Plan is not yet mature for claim".to_string(),
+            ));
+        }
 
         let contract_plan_id = plan.contract_plan_id.unwrap_or(0_i64);
 
+        // ... (Currency validation logic remains same) ...
         let currency = plan
             .currency_preference
             .as_deref()
@@ -293,31 +411,62 @@ impl PlanService {
             )?;
         }
 
+        // 3. FIX: Changed 'db' to '&mut *tx' to keep it atomic
         sqlx::query(
             r#"
-            INSERT INTO claims (plan_id, contract_plan_id, beneficiary_email)
-            VALUES ($1, $2, $3)
-            "#,
+        INSERT INTO claims (plan_id, contract_plan_id, beneficiary_email)
+        VALUES ($1, $2, $3)
+        "#,
         )
         .bind(plan_id)
         .bind(contract_plan_id)
         .bind(req.beneficiary_email.trim())
-        .execute(db)
+        .execute(&mut *tx) // <--- Use the transaction here!
         .await
         .map_err(|e| {
             if let sqlx::Error::Database(ref db_err) = e {
                 if db_err.is_unique_violation() {
-                    return ApiError::BadRequest(
-                        "This plan has already been claimed by this beneficiary".to_string(),
-                    );
+                    return ApiError::BadRequest("This plan has already been claimed".to_string());
                 }
             }
             ApiError::from(e)
         })?;
 
+        // Update plan status to 'claimed' to prevent future concurrent claims
+        sqlx::query(
+            r#"
+            UPDATE plans
+            SET status = 'claimed', updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(plan_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 4. Audit Log
+        AuditLogService::log(
+            &mut *tx,
+            Some(user_id),
+            audit_action::PLAN_CLAIMED,
+            Some(plan_id),
+            Some(entity_type::PLAN),
+        )
+        .await?;
+
+        // Notification: plan claimed
+        NotificationService::create(
+            &mut tx,
+            user_id,
+            notif_type::PLAN_CLAIMED,
+            format!("Plan '{}' has been successfully claimed", plan.title),
+        )
+        .await?; // Use ? to ensure failure here rolls back the claim
+
+        // 6. Final Commit
+        tx.commit().await?;
         Ok(plan)
     }
-
     pub fn is_due_for_claim(
         distribution_method: Option<&str>,
         contract_created_at: Option<i64>,
@@ -623,6 +772,78 @@ impl PlanService {
 
         Ok(due_plans)
     }
+
+    /// Cancel (deactivate) a plan
+    /// Sets the plan status to 'deactivated' and is_active to false
+    pub async fn cancel_plan(
+        pool: &PgPool, // Required to start a transaction if one isn't provided
+        plan_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<PlanWithBeneficiary, ApiError> {
+        // 1. Start the transaction
+        let mut tx = pool.begin().await?;
+
+        // 2. Fetch the plan using the transaction handle
+        // Note: get_plan_by_id must also use the generic <'a, E> pattern
+        let plan = Self::get_plan_by_id(&mut *tx, plan_id, user_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Plan {} not found", plan_id)))?;
+
+        // Business Logic Checks
+        if plan.status == "deactivated" {
+            return Err(ApiError::BadRequest(
+                "Plan is already deactivated".to_string(),
+            ));
+        }
+        if plan.status == "claimed" {
+            return Err(ApiError::BadRequest(
+                "Cannot cancel a plan that has been claimed".to_string(),
+            ));
+        }
+
+        // 3. Perform the Update
+        let row = sqlx::query_as::<_, PlanRowFull>(
+            r#"
+        UPDATE plans
+        SET status = 'deactivated', is_active = false, updated_at = NOW()
+        WHERE id = $1 AND user_id = $2
+        RETURNING id, user_id, title, description, fee, net_amount, status,
+                  contract_plan_id, distribution_method, is_active, contract_created_at,
+                  beneficiary_name, bank_account_number, bank_name, currency_preference,
+                  created_at, updated_at
+        "#,
+        )
+        .bind(plan_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let updated_plan = plan_row_to_plan_with_beneficiary(&row)?;
+
+        // 4. Atomic Audit Log
+        AuditLogService::log(
+            &mut *tx,
+            Some(user_id),
+            audit_action::PLAN_DEACTIVATED,
+            Some(plan_id),
+            Some(entity_type::PLAN),
+        )
+        .await?;
+
+        // 5. Atomic Notification
+        NotificationService::create(
+            &mut tx,
+            user_id,
+            notif_type::PLAN_DEACTIVATED,
+            format!("Plan '{}' has been deactivated", updated_plan.title),
+        )
+        .await?;
+
+        // 6. Commit
+        tx.commit().await?;
+
+        Ok(updated_plan)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
@@ -668,6 +889,41 @@ pub struct KycRecord {
 pub struct KycService;
 
 impl KycService {
+    pub async fn submit_kyc(pool: &PgPool, user_id: Uuid) -> Result<KycRecord, ApiError> {
+        // 1. Start the transaction
+        let mut tx = pool.begin().await?;
+        let now = Utc::now();
+
+        // 2. Insert record
+        // Adding &mut *tx fixes the "Executor not satisfied" error
+        let record = sqlx::query_as::<_, KycRecord>(
+            r#"
+            INSERT INTO kyc_status (user_id, status, created_at, updated_at)
+            VALUES ($1, 'pending', $2, $2)
+            ON CONFLICT (user_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+            RETURNING user_id, status, reviewed_by, reviewed_at, created_at
+            "#,
+        )
+        .bind(user_id)
+        .bind(now)
+        .fetch_one(&mut *tx) // <--- Use the explicit re-borrow here
+        .await?;
+
+        // 3. Atomic Audit log
+        AuditLogService::log(
+            &mut *tx, // Re-borrow here as well
+            Some(user_id),
+            audit_action::KYC_SUBMITTED,
+            Some(user_id),
+            Some(entity_type::USER),
+        )
+        .await?;
+
+        // 4. Commit
+        tx.commit().await?;
+        Ok(record)
+    }
+
     pub async fn get_kyc_status(db: &PgPool, user_id: Uuid) -> Result<KycRecord, ApiError> {
         let row = sqlx::query_as::<_, KycRecord>(
             "SELECT user_id, status, reviewed_by, reviewed_at, created_at FROM kyc_status WHERE user_id = $1",
@@ -689,34 +945,457 @@ impl KycService {
     }
 
     pub async fn update_kyc_status(
-        db: &PgPool,
+        pool: &PgPool,
         admin_id: Uuid,
         user_id: Uuid,
         status: KycStatus,
     ) -> Result<KycRecord, ApiError> {
+        let mut tx = pool.begin().await?; // Start Transaction
         let status_str = status.to_string();
         let now = Utc::now();
 
         let record = sqlx::query_as::<_, KycRecord>(
             r#"
-            INSERT INTO kyc_status (user_id, status, reviewed_by, reviewed_at, created_at)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (user_id) DO UPDATE 
-            SET status = EXCLUDED.status, 
-                reviewed_by = EXCLUDED.reviewed_by, 
-                reviewed_at = EXCLUDED.reviewed_at
-            RETURNING user_id, status, reviewed_by, reviewed_at, created_at
-            "#,
+        INSERT INTO kyc_status (user_id, status, reviewed_by, reviewed_at, created_at)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (user_id) DO UPDATE SET ...
+        RETURNING user_id, status, reviewed_by, reviewed_at, created_at
+        "#,
         )
         .bind(user_id)
         .bind(status_str)
         .bind(admin_id)
         .bind(now)
         .bind(now)
+        .fetch_one(&mut *tx) // Use Transaction
+        .await?;
+
+        // Prepare notification
+        let (ntype, msg) = match status {
+            KycStatus::Approved => (notif_type::KYC_APPROVED, "Approved".to_string()),
+            KycStatus::Rejected => (notif_type::KYC_REJECTED, "Rejected".to_string()),
+            _ => (notif_type::KYC_APPROVED, "Updated".to_string()),
+        };
+
+        // Notification is now ATOMIC
+        NotificationService::create(&mut tx, user_id, ntype, msg).await?;
+
+        // Audit log is now ATOMIC
+        AuditLogService::log(
+            &mut *tx,
+            Some(admin_id),
+            if record.status == "approved" {
+                audit_action::KYC_APPROVED
+            } else {
+                audit_action::KYC_REJECTED
+            },
+            Some(user_id),
+            Some(entity_type::USER),
+        )
+        .await?;
+
+        tx.commit().await?; // Commit all three operations
+        Ok(record)
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminMetrics {
+    pub total_revenue: f64,
+    pub total_plans: i64,
+    pub total_claims: i64,
+    pub active_plans: i64,
+    pub total_users: i64,
+}
+
+pub struct AdminService;
+
+impl AdminService {
+    pub async fn get_metrics_overview(db: &PgPool) -> Result<AdminMetrics, ApiError> {
+        #[derive(sqlx::FromRow)]
+        struct MetricsRow {
+            total_revenue: f64,
+            total_plans: i64,
+            total_claims: i64,
+            active_plans: i64,
+            total_users: i64,
+        }
+
+        let row = sqlx::query_as::<_, MetricsRow>(
+            r#"
+            SELECT
+                COALESCE(SUM(fee), 0)::FLOAT8 AS total_revenue,
+                COUNT(*)::BIGINT AS total_plans,
+                (SELECT COUNT(*)::BIGINT FROM claims) AS total_claims,
+                COUNT(*) FILTER (
+                    WHERE is_active IS NOT FALSE
+                      AND status NOT IN ('claimed', 'deactivated')
+                )::BIGINT AS active_plans,
+                (SELECT COUNT(*)::BIGINT FROM users) AS total_users
+            FROM plans
+            "#,
+        )
         .fetch_one(db)
         .await?;
 
-        Ok(record)
+        Ok(AdminMetrics {
+            total_revenue: row.total_revenue,
+            total_plans: row.total_plans,
+            total_claims: row.total_claims,
+            active_plans: row.active_plans,
+            total_users: row.total_users,
+        })
+    }
+}
+
+// ── Claim Metrics ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimStatistics {
+    pub total_claims: i64,
+    pub pending_claims: i64,
+    pub approved_claims: i64,
+    pub rejected_claims: i64,
+    pub average_claim_processing_time_seconds: f64,
+}
+
+pub struct ClaimMetricsService;
+
+impl ClaimMetricsService {
+    pub async fn get_claim_statistics(db: &PgPool) -> Result<ClaimStatistics, ApiError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            total_claims: i64,
+            pending_claims: i64,
+            approved_claims: i64,
+            rejected_claims: i64,
+            average_claim_processing_time_seconds: Option<f64>,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"
+            SELECT
+                COUNT(c.id)::BIGINT AS total_claims,
+                COUNT(c.id) FILTER (
+                    WHERE p.status IN ('pending', 'due-for-claim')
+                )::BIGINT AS pending_claims,
+                COUNT(c.id) FILTER (
+                    WHERE p.status = 'claimed'
+                )::BIGINT AS approved_claims,
+                COUNT(c.id) FILTER (
+                    WHERE p.status IN ('rejected', 'deactivated')
+                )::BIGINT AS rejected_claims,
+                AVG(
+                    CASE
+                        WHEN p.status IN ('claimed', 'rejected', 'deactivated')
+                         AND p.updated_at >= c.claimed_at
+                        THEN EXTRACT(EPOCH FROM (p.updated_at - c.claimed_at))
+                        ELSE NULL
+                    END
+                )::FLOAT8 AS average_claim_processing_time_seconds
+            FROM claims c
+            INNER JOIN plans p ON p.id = c.plan_id
+            "#,
+        )
+        .fetch_one(db)
+        .await?;
+
+        Ok(ClaimStatistics {
+            total_claims: row.total_claims,
+            pending_claims: row.pending_claims,
+            approved_claims: row.approved_claims,
+            rejected_claims: row.rejected_claims,
+            average_claim_processing_time_seconds: row
+                .average_claim_processing_time_seconds
+                .unwrap_or(0.0),
+        })
+    }
+}
+
+// ── User Growth Metrics ──────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserGrowthMetrics {
+    pub total_users: i64,
+    pub new_users_last_7_days: i64,
+    pub new_users_last_30_days: i64,
+    pub active_users: i64,
+}
+
+pub struct UserMetricsService;
+
+impl UserMetricsService {
+    pub async fn get_user_growth_metrics(db: &PgPool) -> Result<UserGrowthMetrics, ApiError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            total_users: i64,
+            new_users_last_7_days: i64,
+            new_users_last_30_days: i64,
+            active_users: i64,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"
+            SELECT
+                COUNT(*)::BIGINT AS total_users,
+                COUNT(*) FILTER (
+                    WHERE created_at >= NOW() - INTERVAL '7 days'
+                )::BIGINT AS new_users_last_7_days,
+                COUNT(*) FILTER (
+                    WHERE created_at >= NOW() - INTERVAL '30 days'
+                )::BIGINT AS new_users_last_30_days,
+                COUNT(*) FILTER (
+                    WHERE id IN (
+                        SELECT DISTINCT user_id FROM action_logs
+                        WHERE timestamp >= NOW() - INTERVAL '30 days'
+                          AND user_id IS NOT NULL
+                    )
+                )::BIGINT AS active_users
+            FROM users
+            "#,
+        )
+        .fetch_one(db)
+        .await?;
+
+        Ok(UserGrowthMetrics {
+            total_users: row.total_users,
+            new_users_last_7_days: row.new_users_last_7_days,
+            new_users_last_30_days: row.new_users_last_30_days,
+            active_users: row.active_users,
+        })
+    }
+}
+
+// ── Plan Statistics ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanStatistics {
+    pub total_plans: i64,
+    pub active_plans: i64,
+    pub expired_plans: i64,
+    pub triggered_plans: i64,
+    pub claimed_plans: i64,
+    pub by_status: Vec<PlanStatusCount>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanStatusCount {
+    pub status: String,
+    pub count: i64,
+}
+
+pub struct PlanStatisticsService;
+
+impl PlanStatisticsService {
+    pub async fn get_plan_statistics(db: &PgPool) -> Result<PlanStatistics, ApiError> {
+        // Get total plans count
+        let total_plans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plans")
+            .fetch_one(db)
+            .await?;
+
+        // Get active plans (is_active = true or NULL, and not deactivated/claimed)
+        let active_plans: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM plans
+            WHERE (is_active IS NULL OR is_active = true)
+              AND status NOT IN ('deactivated', 'claimed')
+            "#,
+        )
+        .fetch_one(db)
+        .await?;
+
+        // Get expired plans (plans that are past their claim period but not claimed)
+        // This is a simplified version - you may need to adjust based on your business logic
+        let expired_plans: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM plans
+            WHERE status = 'deactivated'
+            "#,
+        )
+        .fetch_one(db)
+        .await?;
+
+        // Get triggered plans (plans that are due for claim)
+        // Plans with distribution_method set and contract_created_at set
+        let triggered_plans: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM plans
+            WHERE distribution_method IS NOT NULL
+              AND contract_created_at IS NOT NULL
+              AND (is_active IS NULL OR is_active = true)
+              AND status NOT IN ('claimed', 'deactivated')
+            "#,
+        )
+        .fetch_one(db)
+        .await?;
+
+        // Get claimed plans
+        let claimed_plans: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM plans
+            WHERE status = 'claimed'
+            "#,
+        )
+        .fetch_one(db)
+        .await?;
+
+        // Get counts grouped by status
+        let by_status: Vec<PlanStatusCount> = sqlx::query_as::<_, (String, i64)>(
+            r#"
+            SELECT status, COUNT(*) as count
+            FROM plans
+            GROUP BY status
+            ORDER BY count DESC
+            "#,
+        )
+        .fetch_all(db)
+        .await?
+        .into_iter()
+        .map(|(status, count)| PlanStatusCount { status, count })
+        .collect();
+
+        Ok(PlanStatistics {
+            total_plans,
+            active_plans,
+            expired_plans,
+            triggered_plans,
+            claimed_plans,
+            by_status,
+        })
+    }
+}
+
+// ── Revenue Metrics ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RevenueMetric {
+    pub date: String,
+    pub amount: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RevenueMetricsResponse {
+    pub range: String,
+    pub data: Vec<RevenueMetric>,
+}
+
+pub struct RevenueMetricsService;
+
+impl RevenueMetricsService {
+    pub async fn get_revenue_breakdown(
+        pool: &PgPool,
+        range: &str,
+    ) -> Result<RevenueMetricsResponse, ApiError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            date: String,
+            amount: f64,
+        }
+
+        let (interval, trunc) = match range {
+            "daily" => ("30 days", "day"),
+            "weekly" => ("12 weeks", "week"),
+            "monthly" => ("12 months", "month"),
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "Invalid range. Use daily, weekly, or monthly.".to_string(),
+                ))
+            }
+        };
+
+        let query = format!(
+            r#"
+            SELECT 
+                DATE_TRUNC('{}', created_at)::DATE::TEXT as date,
+                COALESCE(SUM(fee), 0)::FLOAT8 as amount
+            FROM plans
+            WHERE created_at >= NOW() - INTERVAL '{}'
+            GROUP BY 1
+            ORDER BY 1
+            "#,
+            trunc, interval
+        );
+
+        let rows = sqlx::query_as::<_, Row>(&query).fetch_all(pool).await?;
+
+        let data = rows
+            .into_iter()
+            .map(|r| RevenueMetric {
+                date: r.date,
+                amount: r.amount,
+            })
+            .collect();
+
+        Ok(RevenueMetricsResponse {
+            range: range.to_string(),
+            data,
+        })
+    }
+}
+
+// ── Lending Pool Metrics ──────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LendingMetrics {
+    pub total_value_locked: f64,
+    pub total_borrowed: f64,
+    pub utilization_rate: f64,
+    pub active_loans_count: i64,
+}
+
+pub struct LendingMonitoringService;
+
+impl LendingMonitoringService {
+    pub async fn get_lending_metrics(db: &PgPool) -> Result<LendingMetrics, ApiError> {
+        #[derive(sqlx::FromRow)]
+        struct MetricsRow {
+            total_deposited: f64,
+            total_borrowed: f64,
+            total_repaid_principal: f64,
+            active_loans_count: i64,
+        }
+
+        let row = sqlx::query_as::<_, MetricsRow>(
+            r#"
+            SELECT
+                (SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0)::FLOAT8 FROM lending_events WHERE event_type = 'deposit') as total_deposited,
+                (SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0)::FLOAT8 FROM lending_events WHERE event_type = 'borrow') as total_borrowed,
+                (SELECT COALESCE(SUM(CAST(metadata->>'principal_amount' AS DECIMAL)), 0)::FLOAT8 FROM lending_events WHERE event_type = 'repay') as total_repaid_principal,
+                (SELECT COUNT(*)::BIGINT FROM (
+                    SELECT plan_id, 
+                           SUM(CASE 
+                                WHEN event_type = 'borrow' THEN CAST(amount AS DECIMAL) 
+                                WHEN event_type = 'repay' THEN -CAST(metadata->>'principal_amount' AS DECIMAL)
+                                ELSE 0 
+                           END) as balance
+                    FROM lending_events 
+                    WHERE plan_id IS NOT NULL 
+                    GROUP BY plan_id
+                ) t WHERE balance > 0) as active_loans_count
+            "#,
+        )
+        .fetch_one(db)
+        .await?;
+
+        let current_debt = row.total_borrowed - row.total_repaid_principal;
+        let tvl = row.total_deposited; // Simplified TVL as total deposits
+
+        let utilization_rate = if tvl > 0.0 {
+            (current_debt / tvl) * 100.0
+        } else {
+            0.0
+        };
+
+        Ok(LendingMetrics {
+            total_value_locked: tvl,
+            total_borrowed: current_debt,
+            utilization_rate,
+            active_loans_count: row.active_loans_count,
+        })
     }
 }
 
@@ -1385,5 +2064,320 @@ mod tests {
         // (10000 / 0.85) / 6.67 ≈ 1764
         assert!(result.liquidation_price > dec!(1500));
         assert!(result.liquidation_price < dec!(2000));
+    }
+}
+
+// ── Emergency Admin Controls ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PausePlanRequest {
+    pub plan_id: Uuid,
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnpausePlanRequest {
+    pub plan_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RiskOverrideRequest {
+    pub plan_id: Uuid,
+    pub enabled: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmergencyActionResponse {
+    pub success: bool,
+    pub plan_id: Uuid,
+    pub message: String,
+}
+
+pub struct EmergencyAdminService;
+
+impl EmergencyAdminService {
+    /// Pause a plan - prevents claims and other operations
+    pub async fn pause_plan(
+        pool: &PgPool,
+        admin_id: Uuid,
+        req: &PausePlanRequest,
+    ) -> Result<EmergencyActionResponse, ApiError> {
+        let mut tx = pool.begin().await?;
+
+        // Verify plan exists
+        let plan = PlanService::get_plan_by_id_any_user(&mut *tx, req.plan_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Plan {} not found", req.plan_id)))?;
+
+        // Check if already paused
+        let is_paused: Option<bool> =
+            sqlx::query_scalar("SELECT is_paused FROM plans WHERE id = $1")
+                .bind(req.plan_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        if is_paused == Some(true) {
+            return Err(ApiError::BadRequest("Plan is already paused".to_string()));
+        }
+
+        // Update plan to paused state
+        sqlx::query(
+            r#"
+            UPDATE plans
+            SET is_paused = true,
+                paused_by = $1,
+                paused_at = NOW(),
+                pause_reason = $2,
+                updated_at = NOW()
+            WHERE id = $3
+            "#,
+        )
+        .bind(admin_id)
+        .bind(&req.reason)
+        .bind(req.plan_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Audit log
+        AuditLogService::log(
+            &mut *tx,
+            Some(admin_id),
+            audit_action::PLAN_PAUSED,
+            Some(req.plan_id),
+            Some(entity_type::PLAN),
+        )
+        .await?;
+
+        // Notify user
+        NotificationService::create(
+            &mut tx,
+            plan.user_id,
+            notif_type::PLAN_PAUSED,
+            format!(
+                "Your plan '{}' has been temporarily paused by an administrator. Reason: {}",
+                plan.title, req.reason
+            ),
+        )
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(EmergencyActionResponse {
+            success: true,
+            plan_id: req.plan_id,
+            message: "Plan paused successfully".to_string(),
+        })
+    }
+
+    /// Unpause a plan - restores normal operations
+    pub async fn unpause_plan(
+        pool: &PgPool,
+        admin_id: Uuid,
+        req: &UnpausePlanRequest,
+    ) -> Result<EmergencyActionResponse, ApiError> {
+        let mut tx = pool.begin().await?;
+
+        // Verify plan exists
+        let plan = PlanService::get_plan_by_id_any_user(&mut *tx, req.plan_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Plan {} not found", req.plan_id)))?;
+
+        // Check if actually paused
+        let is_paused: Option<bool> =
+            sqlx::query_scalar("SELECT is_paused FROM plans WHERE id = $1")
+                .bind(req.plan_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        if is_paused != Some(true) {
+            return Err(ApiError::BadRequest("Plan is not paused".to_string()));
+        }
+
+        // Update plan to unpaused state
+        sqlx::query(
+            r#"
+            UPDATE plans
+            SET is_paused = false,
+                paused_by = NULL,
+                paused_at = NULL,
+                pause_reason = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(req.plan_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Audit log
+        AuditLogService::log(
+            &mut *tx,
+            Some(admin_id),
+            audit_action::PLAN_UNPAUSED,
+            Some(req.plan_id),
+            Some(entity_type::PLAN),
+        )
+        .await?;
+
+        // Notify user
+        NotificationService::create(
+            &mut tx,
+            plan.user_id,
+            notif_type::PLAN_UNPAUSED,
+            format!(
+                "Your plan '{}' has been unpaused and is now active again",
+                plan.title
+            ),
+        )
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(EmergencyActionResponse {
+            success: true,
+            plan_id: req.plan_id,
+            message: "Plan unpaused successfully".to_string(),
+        })
+    }
+
+    /// Apply or remove risk override for a plan
+    pub async fn set_risk_override(
+        pool: &PgPool,
+        admin_id: Uuid,
+        req: &RiskOverrideRequest,
+    ) -> Result<EmergencyActionResponse, ApiError> {
+        let mut tx = pool.begin().await?;
+
+        // Verify plan exists
+        let plan = PlanService::get_plan_by_id_any_user(&mut *tx, req.plan_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Plan {} not found", req.plan_id)))?;
+
+        let action_type = if req.enabled {
+            audit_action::RISK_OVERRIDE_APPLIED
+        } else {
+            audit_action::RISK_OVERRIDE_REMOVED
+        };
+
+        let notif_type = if req.enabled {
+            notif_type::RISK_OVERRIDE_APPLIED
+        } else {
+            notif_type::RISK_OVERRIDE_REMOVED
+        };
+
+        // Update risk override settings
+        if req.enabled {
+            sqlx::query(
+                r#"
+                UPDATE plans
+                SET risk_override_enabled = true,
+                    risk_override_by = $1,
+                    risk_override_at = NOW(),
+                    risk_override_reason = $2,
+                    updated_at = NOW()
+                WHERE id = $3
+                "#,
+            )
+            .bind(admin_id)
+            .bind(&req.reason)
+            .bind(req.plan_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE plans
+                SET risk_override_enabled = false,
+                    risk_override_by = NULL,
+                    risk_override_at = NULL,
+                    risk_override_reason = NULL,
+                    updated_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(req.plan_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Audit log
+        AuditLogService::log(
+            &mut *tx,
+            Some(admin_id),
+            action_type,
+            Some(req.plan_id),
+            Some(entity_type::PLAN),
+        )
+        .await?;
+
+        // Notify user
+        let message = if req.enabled {
+            format!(
+                "Risk monitoring override has been applied to your plan '{}'. Reason: {}",
+                plan.title, req.reason
+            )
+        } else {
+            format!(
+                "Risk monitoring override has been removed from your plan '{}'",
+                plan.title
+            )
+        };
+
+        NotificationService::create(&mut tx, plan.user_id, notif_type, message).await?;
+
+        tx.commit().await?;
+
+        let action_msg = if req.enabled {
+            "Risk override applied successfully"
+        } else {
+            "Risk override removed successfully"
+        };
+
+        Ok(EmergencyActionResponse {
+            success: true,
+            plan_id: req.plan_id,
+            message: action_msg.to_string(),
+        })
+    }
+
+    /// Get all paused plans
+    pub async fn get_paused_plans(db: &PgPool) -> Result<Vec<PlanWithBeneficiary>, ApiError> {
+        let rows = sqlx::query_as::<_, PlanRowFull>(
+            r#"
+            SELECT id, user_id, title, description, fee, net_amount, status,
+                   contract_plan_id, distribution_method, is_active, contract_created_at,
+                   beneficiary_name, bank_account_number, bank_name, currency_preference,
+                   created_at, updated_at
+            FROM plans
+            WHERE is_paused = true
+            ORDER BY paused_at DESC
+            "#,
+        )
+        .fetch_all(db)
+        .await?;
+
+        rows.iter().map(plan_row_to_plan_with_beneficiary).collect()
+    }
+
+    /// Get all plans with risk override
+    pub async fn get_risk_override_plans(
+        db: &PgPool,
+    ) -> Result<Vec<PlanWithBeneficiary>, ApiError> {
+        let rows = sqlx::query_as::<_, PlanRowFull>(
+            r#"
+            SELECT id, user_id, title, description, fee, net_amount, status,
+                   contract_plan_id, distribution_method, is_active, contract_created_at,
+                   beneficiary_name, bank_account_number, bank_name, currency_preference,
+                   created_at, updated_at
+            FROM plans
+            WHERE risk_override_enabled = true
+            ORDER BY risk_override_at DESC
+            "#,
+        )
+        .fetch_all(db)
+        .await?;
+
+        rows.iter().map(plan_row_to_plan_with_beneficiary).collect()
     }
 }

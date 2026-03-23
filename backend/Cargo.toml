@@ -10,7 +10,7 @@ tokio-util = "0.7"
 
 # Web framework
 axum = { version = "0.7", features = ["json", "multipart", "macros"] }
-tower = "0.4"
+tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "request-id", "util"] }
 tower_governor = "0.4.2"
 governor = "0.6.3"
@@ -29,7 +29,8 @@ sqlx = { version = "0.7", features = [
     "migrate",
     "rust_decimal"
 ] }
-rust_decimal = { version = "1.33", features = ["serde-with-str"] }
+rust_decimal = { version = "1.33", features = ["serde-with-str", "db-postgres"] }
+rust_decimal_macros = "1.33"
 
 # Authentication & Security
 jsonwebtoken = "9.0"
@@ -44,7 +45,7 @@ postgres-types = { version = "0.2", features = ["with-chrono-0_4", "with-uuid-1"
 soroban-sdk = "21.0"
 
 # HTTP client
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 # Logging
 tracing = "0.1"
@@ -62,8 +63,10 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1.10"
 base64 = "0.21"
+hex = "0.4"
 dotenvy = "0.15"
 async-trait = "0.1"
+stellar-strkey = "0.0.16"
 
 
 # Testing
@@ -71,3 +74,5 @@ async-trait = "0.1"
 tokio-test = "0.4"
 httpmock = "0.7"
 rust_decimal_macros = "1.33"
+
+
