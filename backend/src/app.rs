@@ -256,8 +256,7 @@ async fn get_simulation(
     AuthenticatedUser(user): AuthenticatedUser,
 ) -> Result<Json<Value>, ApiError> {
     let simulation =
-        LoanSimulationService::get_simulation_by_id(&state.db, simulation_id, user.user_id)
-            .await?;
+        LoanSimulationService::get_simulation_by_id(&state.db, simulation_id, user.user_id).await?;
     match simulation {
         Some(sim) => Ok(Json(json!({
             "status": "success",
