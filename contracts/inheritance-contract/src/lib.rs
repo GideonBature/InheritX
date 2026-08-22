@@ -8,6 +8,8 @@ use soroban_sdk::{
 mod disputes;
 use disputes::{DisputeRecord, DisputeStatus};
 
+mod yield_math;
+
 /// Current contract version - bump this on each upgrade
 const CONTRACT_VERSION: u32 = 1;
 
@@ -16,6 +18,16 @@ const MAX_BENEFICIARIES: u32 = 10;
 
 /// Emergency transfer limit in basis points (10% = 1000 bp)
 const EMERGENCY_TRANSFER_LIMIT_BP: u32 = 1000;
+
+/// Hard cap on yield relayer accounts — bounds the O(n) relayer scan.
+const MAX_YIELD_RELAYERS: u32 = 10;
+
+/// Harvest records retained per plan. Oldest entries are evicted past this, so
+/// a long-lived plan's state stays a fixed size.
+const MAX_YIELD_HISTORY: u32 = 20;
+
+/// Hard cap on plans per batch harvest — bounds the O(n) sweep loop.
+const MAX_YIELD_BATCH: u32 = 25;
 
 /// Emergency cooldown period in seconds (24 hours)
 const EMERGENCY_COOLDOWN_PERIOD: u64 = 86400;
@@ -180,6 +192,9 @@ pub enum DataKey {
     Dispute(u64),      // dispute_id -> DisputeRecord
     PlanDisputes(u64), // plan_id -> Vec<u64> (dispute ids)
     Arbitrators,       // Vec<Address>
+    // Yield harvesting
+    YieldRelayers,   // Vec<Address> of accounts allowed to trigger harvests
+    YieldState(u64), // plan_id -> PlanYieldState
 }
 
 #[contracttype]
@@ -280,6 +295,152 @@ pub struct KycRejectedEvent {
 pub struct ContractLinkedEvent {
     pub contract_type: Symbol,
     pub address: Address,
+}
+
+/// Per-plan yield policy, set by the owner or an admin.
+///
+/// Defaults (see [`YieldConfig::default_config`]) are deliberately permissive:
+/// compound everything, immediately, with no protocol cut. A plan only becomes
+/// more restrictive if somebody configures it that way.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldConfig {
+    /// When true, a harvest adds straight to `total_amount`. When false it
+    /// accrues to `pending_credit` for a later `compound_pending_yield` call,
+    /// so an owner can review before the balance moves.
+    pub auto_compound: bool,
+    /// Smallest harvest worth executing. Below this the call reports
+    /// `NothingToClaim` rather than burning gas on dust.
+    pub min_harvest_amount: u64,
+    /// Minimum seconds between harvests. Zero disables the cooldown.
+    pub harvest_interval: u64,
+    /// Protocol cut of each harvest, in basis points, capped at 50%. The fee
+    /// is simply not compounded — it stays with the pool rather than moving
+    /// tokens, since a harvest is a bookkeeping credit, not a transfer.
+    pub performance_fee_bp: u32,
+}
+
+impl YieldConfig {
+    /// Compound everything, immediately, with no fee.
+    pub fn default_config() -> YieldConfig {
+        YieldConfig {
+            auto_compound: true,
+            min_harvest_amount: 0,
+            harvest_interval: 0,
+            performance_fee_bp: 0,
+        }
+    }
+}
+
+/// One entry in a plan's harvest history.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldHarvestRecord {
+    pub gross_amount: u64,
+    pub net_amount: u64,
+    pub fee_amount: u64,
+    pub harvested_at: u64,
+    pub harvested_by: Address,
+    pub compounded: bool,
+}
+
+/// Per-plan yield bookkeeping, created when the plan's position is registered
+/// with the lending pool.
+///
+/// Everything yield-related for a plan rides in this one record rather than in
+/// separate storage keys: `DataKey` sits at the 50-variant ceiling
+/// `#[contracttype]` permits for enums, so new fields are free but new keys
+/// are not.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanYieldState {
+    pub asset: Address,
+    pub last_harvest_at: u64,
+    pub total_harvested: u64,
+    pub total_fees_paid: u64,
+    pub harvest_count: u32,
+    pub last_harvest_amount: u64,
+    pub registered_principal: u64,
+    pub pending_credit: u64,
+    pub paused: bool,
+    pub config: YieldConfig,
+    pub history: Vec<YieldHarvestRecord>,
+}
+
+/// Everything a caller needs to render a plan's yield position, in one read.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldSummary {
+    pub plan_id: u64,
+    pub asset: Address,
+    pub registered_principal: u64,
+    pub total_harvested: u64,
+    pub total_fees_paid: u64,
+    pub pending_credit: u64,
+    pub harvest_count: u32,
+    pub last_harvest_at: u64,
+    pub last_harvest_amount: u64,
+    pub next_harvest_at: u64,
+    pub paused: bool,
+    pub auto_compound: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldHarvestedEvent {
+    pub plan_id: u64,
+    pub yield_amount: u64,
+    pub new_total_amount: u64,
+    pub harvested_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldFeeCollectedEvent {
+    pub plan_id: u64,
+    pub gross_amount: u64,
+    pub fee_amount: u64,
+    pub fee_bp: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldConfigUpdatedEvent {
+    pub plan_id: u64,
+    pub auto_compound: bool,
+    pub min_harvest_amount: u64,
+    pub harvest_interval: u64,
+    pub performance_fee_bp: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldPausedEvent {
+    pub plan_id: u64,
+    pub paused: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldBatchHarvestEvent {
+    pub success_count: u32,
+    pub fail_count: u32,
+    pub total_harvested: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldPositionRegisteredEvent {
+    pub plan_id: u64,
+    pub asset: Address,
+    pub principal: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct YieldRelayerUpdatedEvent {
+    pub relayer: Address,
+    pub authorized: bool,
 }
 
 #[contracttype]
@@ -5614,7 +5775,6 @@ impl InheritanceContract {
         );
     }
 
-    #[allow(dead_code)]
     fn require_lending_contract(env: &Env) -> Result<Address, InheritanceError> {
         Self::get_lending_contract(env.clone()).ok_or(InheritanceError::AdminNotSet)
     }
@@ -5624,7 +5784,6 @@ impl InheritanceContract {
         Self::get_governance_contract(env.clone()).ok_or(InheritanceError::AdminNotSet)
     }
 
-    #[allow(dead_code)]
     fn invoke_lending_contract<R>(
         env: &Env,
         method: Symbol,
@@ -5659,6 +5818,990 @@ impl InheritanceContract {
             return plan.owner == user;
         }
         false
+    }
+
+    // ─── Automated Yield Harvest & Reinvestment ──────────────────
+
+    /// Authorize a yield-harvest caller: the plan owner, a protocol admin, or
+    /// a registered relayer (the scheduled keeper that drives harvests without
+    /// the owner having to sign each one).
+    fn require_harvest_authority(
+        env: &Env,
+        caller: &Address,
+        plan: &InheritancePlan,
+    ) -> Result<(), InheritanceError> {
+        caller.require_auth();
+        Self::check_harvest_authority(env, caller, plan)
+    }
+
+    /// The authorization half of [`Self::require_harvest_authority`], without
+    /// the `require_auth` call.
+    ///
+    /// Split out because Soroban rejects a second `require_auth` for the same
+    /// address in one frame — `harvest_yield_batch` authorizes once up front
+    /// and then checks each plan with this.
+    fn check_harvest_authority(
+        env: &Env,
+        caller: &Address,
+        plan: &InheritancePlan,
+    ) -> Result<(), InheritanceError> {
+        if caller == &plan.owner {
+            return Ok(());
+        }
+        if access_control::has_role(env, caller, Role::Admin) {
+            return Ok(());
+        }
+        if Self::get_relayers(env).contains(caller) {
+            return Ok(());
+        }
+        Err(InheritanceError::Unauthorized)
+    }
+
+    /// Authorize a caller for settings that change a plan's yield economics.
+    ///
+    /// Stricter than [`Self::require_harvest_authority`]: relayers may pull
+    /// the harvest lever but may not reconfigure fees, cooldowns, or pause
+    /// state. Those stay with the owner and admins.
+    fn require_yield_config_authority(
+        env: &Env,
+        caller: &Address,
+        plan: &InheritancePlan,
+    ) -> Result<(), InheritanceError> {
+        caller.require_auth();
+
+        if caller == &plan.owner {
+            return Ok(());
+        }
+        if access_control::has_role(env, caller, Role::Admin) {
+            return Ok(());
+        }
+        Err(InheritanceError::Unauthorized)
+    }
+
+    fn get_relayers(env: &Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::YieldRelayers)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Authorize `relayer` to trigger harvests for any plan. Admin only.
+    ///
+    /// Idempotent: re-adding an existing relayer is a no-op rather than an
+    /// error, so a scheduler re-running its bootstrap does not revert.
+    pub fn add_yield_relayer(
+        env: Env,
+        admin: Address,
+        relayer: Address,
+    ) -> Result<(), InheritanceError> {
+        Self::require_admin(&env, &admin)?;
+
+        let mut relayers = Self::get_relayers(&env);
+        if relayers.contains(&relayer) {
+            return Ok(());
+        }
+        if relayers.len() >= MAX_YIELD_RELAYERS {
+            return Err(InheritanceError::TooManyBeneficiaries);
+        }
+
+        relayers.push_back(relayer.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldRelayers, &relayers);
+
+        env.events().publish(
+            (symbol_short!("YIELD"), symbol_short!("RELAYER")),
+            YieldRelayerUpdatedEvent {
+                relayer,
+                authorized: true,
+            },
+        );
+        Ok(())
+    }
+
+    /// Revoke a relayer's harvest authority. Admin only.
+    pub fn remove_yield_relayer(
+        env: Env,
+        admin: Address,
+        relayer: Address,
+    ) -> Result<(), InheritanceError> {
+        Self::require_admin(&env, &admin)?;
+
+        let relayers = Self::get_relayers(&env);
+        let index = relayers
+            .first_index_of(&relayer)
+            .ok_or(InheritanceError::Unauthorized)?;
+
+        let mut updated = relayers;
+        updated.remove(index);
+        env.storage()
+            .instance()
+            .set(&DataKey::YieldRelayers, &updated);
+
+        env.events().publish(
+            (symbol_short!("YIELD"), symbol_short!("RELAYER")),
+            YieldRelayerUpdatedEvent {
+                relayer,
+                authorized: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// List the accounts currently authorized to trigger harvests.
+    pub fn get_yield_relayers(env: Env) -> Vec<Address> {
+        Self::get_relayers(&env)
+    }
+
+    /// Whether `address` may trigger harvests as a relayer.
+    pub fn is_yield_relayer(env: Env, address: Address) -> bool {
+        Self::get_relayers(&env).contains(&address)
+    }
+
+    // ─── Yield position lifecycle ────────────────
+
+    fn get_yield_state(env: &Env, plan_id: u64) -> Option<PlanYieldState> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::YieldState(plan_id))
+    }
+
+    fn set_yield_state(env: &Env, plan_id: u64, state: &PlanYieldState) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::YieldState(plan_id), state);
+    }
+
+    fn require_yield_state(env: &Env, plan_id: u64) -> Result<PlanYieldState, InheritanceError> {
+        Self::get_yield_state(env, plan_id).ok_or(InheritanceError::PlanNotFound)
+    }
+
+    /// Append to a plan's harvest history, evicting the oldest entry once the
+    /// ring is full so the record stays a fixed size regardless of how long a
+    /// plan runs.
+    fn push_history(env: &Env, state: &mut PlanYieldState, record: YieldHarvestRecord) {
+        if state.history.len() >= MAX_YIELD_HISTORY {
+            state.history.remove(0);
+        }
+        let _ = env;
+        state.history.push_back(record);
+    }
+
+    /// Register the plan's locked balance as a yield-bearing position in the
+    /// configured lending pool, so interest starts accruing against it.
+    ///
+    /// The registered principal is the plan's unencumbered balance
+    /// (`total_amount - total_loaned`). Call this again after a deposit,
+    /// withdrawal, or loan changes the plan's balance — re-registering resets
+    /// the pool's accrual watermark, so harvest first if interest is pending.
+    ///
+    /// Callable by the plan owner, an admin, or a registered relayer.
+    pub fn register_yield_position(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+        asset: Address,
+    ) -> Result<(), InheritanceError> {
+        Self::check_not_paused(&env);
+
+        let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        Self::require_harvest_authority(&env, &caller, &plan)?;
+
+        if !plan.is_active || !plan.earn_yield {
+            return Err(InheritanceError::PlanNotActive);
+        }
+
+        let principal = plan.total_amount.saturating_sub(plan.total_loaned);
+        let args: Vec<Val> = vec![
+            &env,
+            env.current_contract_address().into_val(&env),
+            plan_id.into_val(&env),
+            asset.clone().into_val(&env),
+            principal.into_val(&env),
+        ];
+        Self::invoke_lending_contract::<()>(&env, Symbol::new(&env, "register_plan_yield"), args)?;
+
+        let now = env.ledger().timestamp();
+        let state = match Self::get_yield_state(&env, plan_id) {
+            // Re-registering keeps the plan's history and lifetime totals; only
+            // the asset, principal, and watermark move.
+            Some(mut existing) => {
+                existing.asset = asset.clone();
+                existing.registered_principal = principal;
+                existing.last_harvest_at = now;
+                existing
+            }
+            None => PlanYieldState {
+                asset: asset.clone(),
+                last_harvest_at: now,
+                total_harvested: 0,
+                total_fees_paid: 0,
+                harvest_count: 0,
+                last_harvest_amount: 0,
+                registered_principal: principal,
+                pending_credit: 0,
+                paused: false,
+                config: YieldConfig::default_config(),
+                history: Vec::new(&env),
+            },
+        };
+        Self::set_yield_state(&env, plan_id, &state);
+
+        env.events().publish(
+            (symbol_short!("YIELD"), symbol_short!("REGISTER")),
+            YieldPositionRegisteredEvent {
+                plan_id,
+                asset,
+                principal,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Re-register the plan's position at its current unencumbered balance.
+    ///
+    /// Convenience wrapper over [`Self::register_yield_position`] that reuses
+    /// the asset already on file, so a keeper can resync after a deposit or
+    /// loan without having to look the asset up.
+    pub fn sync_yield_principal(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+    ) -> Result<u64, InheritanceError> {
+        let state = Self::require_yield_state(&env, plan_id)?;
+        let asset = state.asset.clone();
+        Self::register_yield_position(env.clone(), caller, plan_id, asset)?;
+        Ok(Self::require_yield_state(&env, plan_id)?.registered_principal)
+    }
+
+    /// Drop a plan's yield position from the pool and clear its local record.
+    ///
+    /// Any uncompounded `pending_credit` is compounded into the plan first, so
+    /// unregistering never silently discards yield the plan has already been
+    /// paid.
+    pub fn unregister_yield_position(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+    ) -> Result<(), InheritanceError> {
+        Self::check_not_paused(&env);
+
+        let mut plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        Self::require_yield_config_authority(&env, &caller, &plan)?;
+
+        let state = Self::require_yield_state(&env, plan_id)?;
+
+        if state.pending_credit > 0 {
+            plan.total_amount = yield_math::safe_add(plan.total_amount, state.pending_credit)?;
+            Self::store_plan(&env, plan_id, &plan);
+        }
+
+        let args: Vec<Val> = vec![
+            &env,
+            env.current_contract_address().into_val(&env),
+            plan_id.into_val(&env),
+        ];
+        Self::invoke_lending_contract::<()>(
+            &env,
+            Symbol::new(&env, "unregister_plan_yield"),
+            args,
+        )?;
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::YieldState(plan_id));
+
+        Ok(())
+    }
+
+    // ─── Yield configuration ─────────────────────
+
+    /// Set a plan's yield policy. Owner or admin only — relayers may harvest
+    /// but may not change the economics of what they harvest.
+    ///
+    /// # Errors
+    /// - `PlanNotFound` — no plan, or no registered yield position
+    /// - `Unauthorized` — caller is neither the owner nor an admin
+    /// - `InvalidAllocation` — `performance_fee_bp` exceeds the 50% cap
+    pub fn set_yield_config(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+        auto_compound: bool,
+        min_harvest_amount: u64,
+        harvest_interval: u64,
+        performance_fee_bp: u32,
+    ) -> Result<(), InheritanceError> {
+        Self::check_not_paused(&env);
+
+        let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        Self::require_yield_config_authority(&env, &caller, &plan)?;
+        yield_math::validate_performance_fee(performance_fee_bp)?;
+
+        let mut state = Self::require_yield_state(&env, plan_id)?;
+        state.config = YieldConfig {
+            auto_compound,
+            min_harvest_amount,
+            harvest_interval,
+            performance_fee_bp,
+        };
+        Self::set_yield_state(&env, plan_id, &state);
+
+        env.events().publish(
+            (symbol_short!("YIELD"), symbol_short!("CONFIG")),
+            YieldConfigUpdatedEvent {
+                plan_id,
+                auto_compound,
+                min_harvest_amount,
+                harvest_interval,
+                performance_fee_bp,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Read a plan's yield policy.
+    pub fn get_yield_config(env: Env, plan_id: u64) -> Option<YieldConfig> {
+        Self::get_yield_state(&env, plan_id).map(|st| st.config)
+    }
+
+    /// Suspend harvesting for a plan without unregistering its position.
+    ///
+    /// Interest keeps accruing in the pool; it simply cannot be pulled into
+    /// the vault until resumed. Owner or admin only.
+    pub fn pause_plan_yield(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+    ) -> Result<(), InheritanceError> {
+        Self::set_plan_yield_paused(env, caller, plan_id, true)
+    }
+
+    /// Resume harvesting for a previously paused plan.
+    pub fn resume_plan_yield(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+    ) -> Result<(), InheritanceError> {
+        Self::set_plan_yield_paused(env, caller, plan_id, false)
+    }
+
+    fn set_plan_yield_paused(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+        paused: bool,
+    ) -> Result<(), InheritanceError> {
+        Self::check_not_paused(&env);
+
+        let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        Self::require_yield_config_authority(&env, &caller, &plan)?;
+
+        let mut state = Self::require_yield_state(&env, plan_id)?;
+        state.paused = paused;
+        Self::set_yield_state(&env, plan_id, &state);
+
+        env.events().publish(
+            (symbol_short!("YIELD"), symbol_short!("PAUSE")),
+            YieldPausedEvent { plan_id, paused },
+        );
+
+        Ok(())
+    }
+
+    /// Whether harvesting is currently suspended for a plan.
+    pub fn is_plan_yield_paused(env: Env, plan_id: u64) -> bool {
+        Self::get_yield_state(&env, plan_id)
+            .map(|st| st.paused)
+            .unwrap_or(false)
+    }
+
+    // ─── Yield reads ─────────────────────────────
+
+    /// Yield bookkeeping for a plan, present once its position is registered.
+    pub fn get_yield_state_of(env: Env, plan_id: u64) -> Option<PlanYieldState> {
+        Self::get_yield_state(&env, plan_id)
+    }
+
+    /// Yield the plan could harvest right now, as reported by the lending pool.
+    ///
+    /// Returns `FeeTransferFailed` if the pool cannot be reached or the plan
+    /// has no registered position — see `harvest_yield` for why that variant
+    /// carries the cross-contract failure cases.
+    pub fn get_pending_yield(env: Env, plan_id: u64) -> Result<u64, InheritanceError> {
+        let args: Vec<Val> = vec![&env, plan_id.into_val(&env)];
+        Self::invoke_lending_contract::<u64>(
+            &env,
+            Symbol::new(&env, "get_accrued_plan_yield"),
+            args,
+        )
+    }
+
+    /// Lifetime yield compounded into a plan.
+    pub fn get_total_yield_harvested(env: Env, plan_id: u64) -> u64 {
+        Self::get_yield_state(&env, plan_id)
+            .map(|st| st.total_harvested)
+            .unwrap_or(0)
+    }
+
+    /// Lifetime protocol fees withheld from a plan's harvests.
+    pub fn get_total_yield_fees(env: Env, plan_id: u64) -> u64 {
+        Self::get_yield_state(&env, plan_id)
+            .map(|st| st.total_fees_paid)
+            .unwrap_or(0)
+    }
+
+    /// Timestamp of the plan's last successful harvest (0 if never harvested).
+    pub fn get_last_yield_harvest(env: Env, plan_id: u64) -> u64 {
+        Self::get_yield_state(&env, plan_id)
+            .map(|st| st.last_harvest_at)
+            .unwrap_or(0)
+    }
+
+    /// The asset the plan's yield position is denominated in, if registered.
+    pub fn get_yield_asset(env: Env, plan_id: u64) -> Option<Address> {
+        Self::get_yield_state(&env, plan_id).map(|st| st.asset)
+    }
+
+    /// Harvested-but-not-yet-compounded yield, held for plans that have
+    /// `auto_compound` switched off.
+    pub fn get_pending_credit(env: Env, plan_id: u64) -> u64 {
+        Self::get_yield_state(&env, plan_id)
+            .map(|st| st.pending_credit)
+            .unwrap_or(0)
+    }
+
+    /// The plan's recent harvests, oldest first, capped at
+    /// [`MAX_YIELD_HISTORY`] entries.
+    pub fn get_yield_history(env: Env, plan_id: u64) -> Vec<YieldHarvestRecord> {
+        Self::get_yield_state(&env, plan_id)
+            .map(|st| st.history)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Number of harvests executed against a plan.
+    pub fn get_yield_harvest_count(env: Env, plan_id: u64) -> u32 {
+        Self::get_yield_state(&env, plan_id)
+            .map(|st| st.harvest_count)
+            .unwrap_or(0)
+    }
+
+    /// The earliest timestamp at which the plan's next harvest is eligible.
+    pub fn get_next_harvest_at(env: Env, plan_id: u64) -> u64 {
+        Self::get_yield_state(&env, plan_id)
+            .map(|st| yield_math::next_harvest_at(st.last_harvest_at, st.config.harvest_interval))
+            .unwrap_or(0)
+    }
+
+    /// Whether a harvest would go through right now: not paused, cooldown
+    /// elapsed, and pending yield above the configured floor.
+    ///
+    /// Returns `false` rather than erroring when the pool is unreachable, so a
+    /// scheduler can poll this cheaply without handling failures.
+    pub fn is_harvest_due(env: Env, plan_id: u64) -> bool {
+        let state = match Self::get_yield_state(&env, plan_id) {
+            Some(st) => st,
+            None => return false,
+        };
+        if state.paused {
+            return false;
+        }
+        let pending = match Self::get_pending_yield(env.clone(), plan_id) {
+            Ok(amount) => amount,
+            Err(_) => return false,
+        };
+        yield_math::is_harvest_due(
+            env.ledger().timestamp(),
+            state.last_harvest_at,
+            state.config.harvest_interval,
+            pending,
+            state.config.min_harvest_amount,
+        )
+    }
+
+    /// One-shot read of everything about a plan's yield position.
+    ///
+    /// `pending` is omitted deliberately — it needs a cross-contract call, and
+    /// callers that want it should pair this with `get_pending_yield`.
+    pub fn get_yield_summary(env: Env, plan_id: u64) -> Result<YieldSummary, InheritanceError> {
+        let state = Self::require_yield_state(&env, plan_id)?;
+        Ok(YieldSummary {
+            plan_id,
+            asset: state.asset.clone(),
+            registered_principal: state.registered_principal,
+            total_harvested: state.total_harvested,
+            total_fees_paid: state.total_fees_paid,
+            pending_credit: state.pending_credit,
+            harvest_count: state.harvest_count,
+            last_harvest_at: state.last_harvest_at,
+            last_harvest_amount: state.last_harvest_amount,
+            next_harvest_at: yield_math::next_harvest_at(
+                state.last_harvest_at,
+                state.config.harvest_interval,
+            ),
+            paused: state.paused,
+            auto_compound: state.config.auto_compound,
+        })
+    }
+
+    // ─── Yield projections ───────────────────────
+
+    /// Project a plan's balance after `days` of daily compounding at
+    /// `annual_rate_bps`.
+    ///
+    /// A forecast, not a promise: the pool's actual rate floats with
+    /// utilization. Use it for UI estimates, never for settlement.
+    ///
+    /// # Errors
+    /// - `PlanNotFound` — no such plan
+    /// - `InvalidAllocation` — rate above 100% APY, or horizon beyond 100 years
+    /// - `InvalidTotalAmount` — the projection would overflow `u64`
+    pub fn project_plan_balance(
+        env: Env,
+        plan_id: u64,
+        annual_rate_bps: u32,
+        days: u64,
+    ) -> Result<u64, InheritanceError> {
+        let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        let principal = plan.total_amount.saturating_sub(plan.total_loaned);
+        yield_math::project_daily_compound(principal, annual_rate_bps, days)
+    }
+
+    /// Interest alone a plan would earn over `days`, excluding principal.
+    pub fn project_plan_interest(
+        env: Env,
+        plan_id: u64,
+        annual_rate_bps: u32,
+        days: u64,
+    ) -> Result<u64, InheritanceError> {
+        let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        let principal = plan.total_amount.saturating_sub(plan.total_loaned);
+        yield_math::project_daily_interest(principal, annual_rate_bps, days)
+    }
+
+    /// The effective APY of a nominal rate compounded daily, in basis points.
+    pub fn effective_apy(env: Env, nominal_annual_rate_bps: u32) -> Result<u32, InheritanceError> {
+        let _ = env;
+        yield_math::effective_apy_bps(nominal_annual_rate_bps)
+    }
+
+    /// Simple (non-compounding) interest a plan would accrue over
+    /// `elapsed_secs` at `annual_rate_bps`.
+    ///
+    /// This matches how the lending pool actually accrues between harvests, so
+    /// it is the right estimate for "what will the next harvest pay", whereas
+    /// the `project_*` functions model repeated compounding over a horizon.
+    pub fn estimate_next_harvest_amount(
+        env: Env,
+        plan_id: u64,
+        annual_rate_bps: u32,
+        elapsed_secs: u64,
+    ) -> Result<u64, InheritanceError> {
+        let state = Self::require_yield_state(&env, plan_id)?;
+        yield_math::simple_interest(state.registered_principal, annual_rate_bps, elapsed_secs)
+    }
+
+    /// Compound an arbitrary principal over `periods` periods at a per-period
+    /// rate, returning the resulting balance.
+    ///
+    /// Exposed as a pure helper so front ends and keepers run the same maths
+    /// the contract does, instead of reimplementing it and drifting.
+    pub fn compute_compound_amount(
+        env: Env,
+        principal: u64,
+        rate_bps_per_period: u32,
+        periods: u64,
+    ) -> Result<u64, InheritanceError> {
+        let _ = env;
+        yield_math::compound_amount(principal, rate_bps_per_period, periods)
+    }
+
+    /// Interest alone from compounding a principal over `periods` periods.
+    pub fn compute_compound_interest(
+        env: Env,
+        principal: u64,
+        rate_bps_per_period: u32,
+        periods: u64,
+    ) -> Result<u64, InheritanceError> {
+        let _ = env;
+        yield_math::compound_interest(principal, rate_bps_per_period, periods)
+    }
+
+    /// The per-day rate, in basis points, implied by an annual rate.
+    ///
+    /// Floors to 0 below 365 bps — daily precision finer than a basis point
+    /// lives in the fixed-point growth factor, not here.
+    pub fn compute_daily_rate_bps(env: Env, annual_rate_bps: u32) -> Result<u32, InheritanceError> {
+        let _ = env;
+        yield_math::daily_rate_bps(annual_rate_bps)
+    }
+
+    /// Whole compounding periods elapsed in a span, at the vault's daily
+    /// period length.
+    pub fn compute_periods_elapsed(env: Env, elapsed_secs: u64) -> Result<u64, InheritanceError> {
+        let _ = env;
+        yield_math::periods_elapsed(elapsed_secs, yield_math::SECONDS_PER_DAY)
+    }
+
+    /// Days elapsed since a plan's last harvest.
+    pub fn days_since_last_harvest(env: Env, plan_id: u64) -> Result<u64, InheritanceError> {
+        let state = Self::require_yield_state(&env, plan_id)?;
+        let elapsed = env
+            .ledger()
+            .timestamp()
+            .saturating_sub(state.last_harvest_at);
+        yield_math::periods_elapsed(elapsed, yield_math::SECONDS_PER_DAY)
+    }
+
+    /// Principal-weighted average of two rates, in basis points.
+    ///
+    /// Used when a plan's balance is split across positions and callers need
+    /// one headline rate to display.
+    pub fn compute_blended_rate(
+        env: Env,
+        principal_a: u64,
+        rate_a_bps: u32,
+        principal_b: u64,
+        rate_b_bps: u32,
+    ) -> Result<u32, InheritanceError> {
+        let _ = env;
+        yield_math::blended_rate_bps(principal_a, rate_a_bps, principal_b, rate_b_bps)
+    }
+
+    /// Annualized rate a plan has actually realized, in basis points.
+    ///
+    /// Derived from lifetime harvests against registered principal and the
+    /// span the position has been open — the backward-looking counterpart to
+    /// the forward-looking `project_*` functions.
+    pub fn realized_yield_rate_bps(env: Env, plan_id: u64) -> Result<u32, InheritanceError> {
+        let state = Self::require_yield_state(&env, plan_id)?;
+
+        if state.registered_principal == 0 || state.harvest_count == 0 {
+            return Ok(0);
+        }
+
+        let first_harvest = state
+            .history
+            .first()
+            .map(|record| record.harvested_at)
+            .unwrap_or(state.last_harvest_at);
+        let span = state.last_harvest_at.saturating_sub(first_harvest);
+        if span == 0 {
+            return Ok(0);
+        }
+
+        // rate = harvested / principal * (year / span), in basis points.
+        let scaled = yield_math::mul_div(
+            state.total_harvested,
+            yield_math::BPS_DENOMINATOR,
+            state.registered_principal,
+        )?;
+        let annualized = yield_math::mul_div(scaled, yield_math::SECONDS_PER_YEAR, span)?;
+
+        Ok(u32::try_from(annualized).unwrap_or(u32::MAX))
+    }
+
+    /// Total value a plan controls: locked balance plus uncompounded credit.
+    pub fn get_total_plan_value(env: Env, plan_id: u64) -> Result<u64, InheritanceError> {
+        let plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        let pending = Self::get_yield_state(&env, plan_id)
+            .map(|st| st.pending_credit)
+            .unwrap_or(0);
+        yield_math::safe_add(plan.total_amount, pending)
+    }
+
+    /// A plan's share of a pool, in basis points — its registered principal
+    /// measured against the pool total the caller supplies.
+    pub fn compute_plan_pool_share_bps(
+        env: Env,
+        plan_id: u64,
+        pool_total: u64,
+    ) -> Result<u32, InheritanceError> {
+        let state = Self::require_yield_state(&env, plan_id)?;
+        if pool_total == 0 {
+            return Ok(0);
+        }
+        let share = yield_math::safe_div(
+            yield_math::safe_mul(state.registered_principal, yield_math::BPS_DENOMINATOR)?,
+            pool_total,
+        )?;
+        Ok(u32::try_from(share).unwrap_or(u32::MAX))
+    }
+
+    /// Split a hypothetical harvest into `(net_to_plan, protocol_fee)` at a
+    /// plan's configured fee rate, without executing anything.
+    pub fn preview_harvest_split(
+        env: Env,
+        plan_id: u64,
+        gross_amount: u64,
+    ) -> Result<(u64, u64), InheritanceError> {
+        let state = Self::require_yield_state(&env, plan_id)?;
+        yield_math::split_performance_fee(gross_amount, state.config.performance_fee_bp)
+    }
+
+    // ─── Harvesting ──────────────────────────────
+
+    /// Harvest accrued interest from the configured lending pool and compound
+    /// it into the plan's locked vault balance.
+    ///
+    /// The claimed yield is added to `total_amount` — it stays inside the
+    /// vault and flows to beneficiaries on distribution, rather than being
+    /// paid out to the caller. If the plan's config has `auto_compound` off,
+    /// the net lands in `pending_credit` for a later `compound_pending_yield`
+    /// call instead. Emits `YIELD/HARVEST`.
+    ///
+    /// # Authorization
+    /// The plan owner, a protocol admin, or a registered yield relayer. A
+    /// relayer lets an off-chain scheduler compound on a cadence without the
+    /// owner signing each harvest.
+    ///
+    /// # Errors
+    /// - `PlanNotFound` — no such plan
+    /// - `Unauthorized` — caller is not owner, admin, or relayer
+    /// - `PlanNotActive` — plan is inactive, has `earn_yield` disabled, or has
+    ///   yield harvesting paused
+    /// - `EmergencyCooldownActive` — the configured harvest interval has not
+    ///   elapsed since the last harvest
+    /// - `NothingToClaim` — no yield accrued, or the amount is below the
+    ///   plan's `min_harvest_amount` floor
+    /// - `AdminNotSet` — no lending contract has been linked
+    /// - `InvalidTotalAmount` — compounding would overflow `total_amount`
+    /// - `FeeTransferFailed` — the lending pool call failed (unreachable pool,
+    ///   unregistered position, or paused pool). `InheritanceError` is at the
+    ///   50-variant ceiling `#[contracterror]` permits, so these share the
+    ///   existing cross-contract failure variant rather than getting their own.
+    pub fn harvest_yield(env: Env, caller: Address, plan_id: u64) -> Result<u64, InheritanceError> {
+        Self::check_not_paused(&env);
+        caller.require_auth();
+        Self::enter_guard(&env);
+        let result = Self::harvest_yield_inner(&env, &caller, plan_id);
+        Self::exit_guard(&env);
+        result
+    }
+
+    fn harvest_yield_inner(
+        env: &Env,
+        caller: &Address,
+        plan_id: u64,
+    ) -> Result<u64, InheritanceError> {
+        let mut plan = Self::get_plan(env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        Self::check_harvest_authority(env, caller, &plan)?;
+
+        if !plan.is_active || !plan.earn_yield {
+            return Err(InheritanceError::PlanNotActive);
+        }
+
+        let mut state = Self::require_yield_state(env, plan_id)?;
+        if state.paused {
+            return Err(InheritanceError::PlanNotActive);
+        }
+
+        let now = env.ledger().timestamp();
+        if state.config.harvest_interval > 0
+            && now
+                < yield_math::next_harvest_at(state.last_harvest_at, state.config.harvest_interval)
+        {
+            return Err(InheritanceError::EmergencyCooldownActive);
+        }
+
+        // Preview first so "nothing accrued yet" and "below the floor" report
+        // as NothingToClaim instead of collapsing into the generic
+        // cross-contract failure — and so a below-floor harvest costs one read
+        // rather than a state-mutating claim we would have to unwind.
+        let pending_args: Vec<Val> = vec![env, plan_id.into_val(env)];
+        let pending: u64 = Self::invoke_lending_contract(
+            env,
+            Symbol::new(env, "get_accrued_plan_yield"),
+            pending_args,
+        )?;
+        if pending == 0 || pending < state.config.min_harvest_amount {
+            return Err(InheritanceError::NothingToClaim);
+        }
+
+        let claim_args: Vec<Val> = vec![
+            env,
+            env.current_contract_address().into_val(env),
+            plan_id.into_val(env),
+        ];
+        let gross: u64 =
+            Self::invoke_lending_contract(env, Symbol::new(env, "claim_plan_yield"), claim_args)?;
+
+        if gross == 0 {
+            return Err(InheritanceError::NothingToClaim);
+        }
+
+        let auto_compound = state.config.auto_compound;
+        let fee_bp = state.config.performance_fee_bp;
+        let (net, fee) = yield_math::split_performance_fee(gross, fee_bp)?;
+
+        if auto_compound {
+            plan.total_amount = yield_math::safe_add(plan.total_amount, net)?;
+            Self::store_plan(env, plan_id, &plan);
+        } else {
+            state.pending_credit = yield_math::safe_add(state.pending_credit, net)?;
+        }
+
+        state.last_harvest_at = now;
+        state.last_harvest_amount = gross;
+        state.total_harvested = state.total_harvested.saturating_add(gross);
+        state.total_fees_paid = state.total_fees_paid.saturating_add(fee);
+        state.harvest_count = state.harvest_count.saturating_add(1);
+        Self::push_history(
+            env,
+            &mut state,
+            YieldHarvestRecord {
+                gross_amount: gross,
+                net_amount: net,
+                fee_amount: fee,
+                harvested_at: now,
+                harvested_by: caller.clone(),
+                compounded: auto_compound,
+            },
+        );
+        Self::set_yield_state(env, plan_id, &state);
+
+        if fee > 0 {
+            env.events().publish(
+                (symbol_short!("YIELD"), symbol_short!("FEE")),
+                YieldFeeCollectedEvent {
+                    plan_id,
+                    gross_amount: gross,
+                    fee_amount: fee,
+                    fee_bp,
+                },
+            );
+        }
+
+        env.events().publish(
+            (symbol_short!("YIELD"), symbol_short!("HARVEST")),
+            YieldHarvestedEvent {
+                plan_id,
+                yield_amount: gross,
+                new_total_amount: plan.total_amount,
+                harvested_at: now,
+            },
+        );
+
+        log!(
+            env,
+            "Harvested {} yield into plan {} — new total {}",
+            gross,
+            plan_id,
+            plan.total_amount
+        );
+
+        Ok(gross)
+    }
+
+    /// Move a plan's `pending_credit` into its locked balance.
+    ///
+    /// Only relevant for plans with `auto_compound` switched off, where each
+    /// harvest parks its net in `pending_credit` until the owner or an admin
+    /// signs off on compounding it.
+    ///
+    /// # Errors
+    /// - `PlanNotFound` — no plan, or no registered yield position
+    /// - `Unauthorized` — caller is neither the owner nor an admin
+    /// - `NothingToClaim` — nothing is waiting to be compounded
+    /// - `InvalidTotalAmount` — compounding would overflow `total_amount`
+    pub fn compound_pending_yield(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+    ) -> Result<u64, InheritanceError> {
+        Self::check_not_paused(&env);
+
+        let mut plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+        Self::require_yield_config_authority(&env, &caller, &plan)?;
+
+        let mut state = Self::require_yield_state(&env, plan_id)?;
+        if state.pending_credit == 0 {
+            return Err(InheritanceError::NothingToClaim);
+        }
+
+        let amount = state.pending_credit;
+        plan.total_amount = yield_math::safe_add(plan.total_amount, amount)?;
+        Self::store_plan(&env, plan_id, &plan);
+
+        state.pending_credit = 0;
+        Self::set_yield_state(&env, plan_id, &state);
+
+        env.events().publish(
+            (symbol_short!("YIELD"), symbol_short!("COMPOUND")),
+            YieldHarvestedEvent {
+                plan_id,
+                yield_amount: amount,
+                new_total_amount: plan.total_amount,
+                harvested_at: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(amount)
+    }
+
+    /// Harvest several plans in one transaction, skipping the ones that are
+    /// not currently harvestable.
+    ///
+    /// Built for the scheduled relayer: a plan that is paused, on cooldown, or
+    /// has nothing accrued is counted as a failure and stepped over rather
+    /// than reverting the whole batch, so one stale plan cannot block the
+    /// sweep. Returns `(success_count, fail_count, total_harvested)`.
+    ///
+    /// The per-plan work is the same as [`Self::harvest_yield`], including its
+    /// authorization check — a caller with no authority over a given plan
+    /// simply fails that entry.
+    pub fn harvest_yield_batch(
+        env: Env,
+        caller: Address,
+        plan_ids: Vec<u64>,
+    ) -> Result<(u32, u32, u64), InheritanceError> {
+        Self::check_not_paused(&env);
+        caller.require_auth();
+
+        if plan_ids.len() > MAX_YIELD_BATCH {
+            return Err(InheritanceError::TooManyBeneficiaries);
+        }
+
+        Self::enter_guard(&env);
+
+        let mut success = 0u32;
+        let mut fail = 0u32;
+        let mut total = 0u64;
+
+        for plan_id in plan_ids.iter() {
+            match Self::harvest_yield_inner(&env, &caller, plan_id) {
+                Ok(amount) => {
+                    success += 1;
+                    total = total.saturating_add(amount);
+                }
+                Err(_) => {
+                    fail += 1;
+                }
+            }
+        }
+
+        Self::exit_guard(&env);
+
+        env.events().publish(
+            (symbol_short!("YIELD"), symbol_short!("BATCH")),
+            YieldBatchHarvestEvent {
+                success_count: success,
+                fail_count: fail,
+                total_harvested: total,
+            },
+        );
+
+        log!(
+            &env,
+            "Batch harvest: {} succeeded, {} skipped, {} total",
+            success,
+            fail,
+            total
+        );
+
+        Ok((success, fail, total))
     }
 
     // ─── Beneficiary Notification & Acknowledgment ────

@@ -3,7 +3,10 @@
 #![allow(unused_variables)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, token, Address, Env};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Events as _, testutils::Ledger, token, Address, Env,
+    TryFromVal,
+};
 
 // ─────────────────────────────────────────────────
 // Helpers
@@ -3012,4 +3015,650 @@ fn test_lending_add_supported_wrapped_token_unauthorized() {
 
     let res = client.try_add_supported_wrapped_token(&non_admin, &wrapped_token);
     assert!(res.is_err());
+}
+
+// ─────────────────────────────────────────────────
+// Plan Yield Harvesting
+// ─────────────────────────────────────────────────
+
+/// Seed a pool with utilization (so the supply rate is non-zero) and a
+/// retained-yield bucket to pay harvests from. Writing pool state directly
+/// keeps these tests focused on the harvest path rather than on rebuilding a
+/// full deposit/borrow/repay cycle.
+fn seed_yield_pool(
+    env: &Env,
+    client: &LendingContractClient<'_>,
+    token: &Address,
+    deposits: u64,
+    borrowed: u64,
+    retained_yield: u64,
+) {
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        let mut pool = LendingContract::get_pool(env, token).unwrap();
+        pool.total_deposits = deposits;
+        pool.total_borrowed = borrowed;
+        pool.retained_yield = retained_yield;
+        LendingContract::set_pool(env, token, &pool);
+    });
+}
+
+#[test]
+fn test_register_plan_yield_stores_position() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    let position = client.get_plan_yield_position(&1u64).unwrap();
+    assert_eq!(position.plan_id, 1);
+    assert_eq!(position.asset, token_addr);
+    assert_eq!(position.principal, 1_000_000);
+    assert_eq!(position.total_harvested, 0);
+    assert_eq!(position.last_harvest_at, env.ledger().timestamp());
+}
+
+#[test]
+fn test_register_plan_yield_rejects_unsupported_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral, admin) = setup(&env);
+
+    let unknown = create_token_addr(&env);
+    let result = client.try_register_plan_yield(&admin, &1u64, &unknown, &1_000u64);
+    assert_eq!(result, Err(Ok(LendingError::AssetNotSupported)));
+}
+
+#[test]
+fn test_register_plan_yield_rejects_unauthorized_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, _admin) = setup(&env);
+
+    let stranger = Address::generate(&env);
+    let result = client.try_register_plan_yield(&stranger, &1u64, &token_addr, &1_000u64);
+    assert_eq!(result, Err(Ok(LendingError::Unauthorized)));
+}
+
+#[test]
+fn test_register_plan_yield_accepts_linked_inheritance_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    let inheritance = Address::generate(&env);
+    client.set_inheritance_contract(&admin, &inheritance);
+
+    // Not an admin, but is the linked vault — allowed.
+    client.register_plan_yield(&inheritance, &7u64, &token_addr, &500u64);
+    assert_eq!(
+        client.get_plan_yield_position(&7u64).unwrap().principal,
+        500
+    );
+}
+
+#[test]
+fn test_accrued_plan_yield_grows_with_time() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    // 50% utilization: borrow rate = 500 + 5000*2000/10000 = 1500 bps;
+    // supply rate = 1500 * 50% * (100% - 10% reserve factor) = 675 bps.
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    assert_eq!(client.get_accrued_plan_yield(&1u64), 0);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+
+    // 1_000_000 * 675bps over a full year = 67_500.
+    assert_eq!(client.get_accrued_plan_yield(&1u64), 67_500);
+}
+
+#[test]
+fn test_accrued_plan_yield_is_capped_by_retained_yield() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    // Only 1_000 of retained yield available to pay out.
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+
+    assert_eq!(client.get_accrued_plan_yield(&1u64), 1_000);
+}
+
+#[test]
+fn test_accrued_plan_yield_zero_without_utilization() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    // Deposits but no borrows: utilization 0, so the supply rate is 0.
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 0, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+
+    assert_eq!(client.get_accrued_plan_yield(&1u64), 0);
+}
+
+#[test]
+fn test_accrued_plan_yield_requires_registration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral, _admin) = setup(&env);
+
+    let result = client.try_get_accrued_plan_yield(&99u64);
+    assert_eq!(result, Err(Ok(LendingError::PlanYieldNotRegistered)));
+}
+
+#[test]
+fn test_claim_plan_yield_draws_down_retained_yield() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+
+    let claimed = client.claim_plan_yield(&admin, &1u64);
+    assert_eq!(claimed, 67_500);
+
+    let pool = client.get_pool_state(&token_addr);
+    assert_eq!(pool.retained_yield, 1_000_000 - 67_500);
+
+    let position = client.get_plan_yield_position(&1u64).unwrap();
+    assert_eq!(position.total_harvested, 67_500);
+    assert_eq!(position.last_harvest_at, start + SECONDS_IN_YEAR);
+}
+
+#[test]
+fn test_claim_plan_yield_advances_watermark() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+    assert_eq!(client.claim_plan_yield(&admin, &1u64), 67_500);
+
+    // Immediately harvesting again pays nothing — no time has elapsed.
+    let result = client.try_claim_plan_yield(&admin, &1u64);
+    assert_eq!(result, Err(Ok(LendingError::NoYieldAccrued)));
+
+    // A second year accrues the same amount again, not two years' worth.
+    env.ledger().set_timestamp(start + 2 * SECONDS_IN_YEAR);
+    assert_eq!(client.claim_plan_yield(&admin, &1u64), 67_500);
+    assert_eq!(
+        client
+            .get_plan_yield_position(&1u64)
+            .unwrap()
+            .total_harvested,
+        135_000
+    );
+}
+
+#[test]
+fn test_claim_plan_yield_rejects_unauthorized_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+
+    let stranger = Address::generate(&env);
+    let result = client.try_claim_plan_yield(&stranger, &1u64);
+    assert_eq!(result, Err(Ok(LendingError::Unauthorized)));
+}
+
+#[test]
+fn test_claim_plan_yield_requires_registration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral, admin) = setup(&env);
+
+    let result = client.try_claim_plan_yield(&admin, &42u64);
+    assert_eq!(result, Err(Ok(LendingError::PlanYieldNotRegistered)));
+}
+
+#[test]
+fn test_re_registering_preserves_lifetime_total_and_resets_watermark() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+    assert_eq!(client.claim_plan_yield(&admin, &1u64), 67_500);
+
+    // Principal doubles; lifetime total carries over, watermark resets.
+    client.register_plan_yield(&admin, &1u64, &token_addr, &2_000_000u64);
+    let position = client.get_plan_yield_position(&1u64).unwrap();
+    assert_eq!(position.principal, 2_000_000);
+    assert_eq!(position.total_harvested, 67_500);
+    assert_eq!(position.last_harvest_at, start + SECONDS_IN_YEAR);
+
+    env.ledger().set_timestamp(start + 2 * SECONDS_IN_YEAR);
+    assert_eq!(client.claim_plan_yield(&admin, &1u64), 135_000);
+}
+
+#[test]
+fn test_claim_plan_yield_blocked_while_pool_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+
+    client.pause_asset_pool(&admin, &token_addr, &true);
+
+    let result = client.try_claim_plan_yield(&admin, &1u64);
+    assert_eq!(result, Err(Ok(LendingError::PoolPaused)));
+}
+
+#[test]
+fn test_claim_plan_yield_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+
+    client.claim_plan_yield(&admin, &1u64);
+
+    let expected = PlanYieldClaimedEvent {
+        plan_id: 1,
+        asset: token_addr.clone(),
+        yield_amount: 67_500,
+        total_harvested: 67_500,
+        timestamp: start + SECONDS_IN_YEAR,
+    };
+    let published = env.events().all();
+    let found = published.iter().any(|(contract, topics, data)| {
+        contract == client.address
+            && topics == (symbol_short!("PLANYLD"), symbol_short!("CLAIM")).into_val(&env)
+            && PlanYieldClaimedEvent::try_from_val(&env, &data).as_ref() == Ok(&expected)
+    });
+    assert!(found, "PLANYLD/CLAIM event was not published");
+}
+
+// ─────────────────────────────────────────────────
+// Plan Yield: registry, boost, batch, funding
+// ─────────────────────────────────────────────────
+
+#[test]
+fn test_plan_yield_index_tracks_registrations() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    assert_eq!(client.get_plan_yield_count(), 0);
+
+    client.register_plan_yield(&admin, &1u64, &token_addr, &100u64);
+    client.register_plan_yield(&admin, &2u64, &token_addr, &200u64);
+    assert_eq!(client.get_plan_yield_count(), 2);
+
+    // Re-registering an existing plan must not duplicate the index entry.
+    client.register_plan_yield(&admin, &1u64, &token_addr, &300u64);
+    assert_eq!(client.get_plan_yield_count(), 2);
+
+    let ids = client.get_registered_plan_ids();
+    assert!(ids.contains(1u64));
+    assert!(ids.contains(2u64));
+}
+
+#[test]
+fn test_unregister_deactivates_but_keeps_history() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+    client.claim_plan_yield(&admin, &1u64);
+
+    client.unregister_plan_yield(&admin, &1u64);
+
+    let position = client.get_plan_yield_position(&1u64).unwrap();
+    assert!(!position.active);
+    assert_eq!(position.principal, 0);
+    assert_eq!(position.total_harvested, 67_500);
+
+    // The index entry survives, so accounting stays complete.
+    assert_eq!(client.get_plan_yield_count(), 1);
+}
+
+#[test]
+fn test_inactive_position_stops_accruing() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+    client.unregister_plan_yield(&admin, &1u64);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+
+    assert_eq!(client.get_accrued_plan_yield(&1u64), 0);
+    assert_eq!(
+        client.try_claim_plan_yield(&admin, &1u64),
+        Err(Ok(LendingError::PlanYieldInactive))
+    );
+}
+
+#[test]
+fn test_reregistering_reactivates_in_place() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+    client.unregister_plan_yield(&admin, &1u64);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &500_000u64);
+
+    let position = client.get_plan_yield_position(&1u64).unwrap();
+    assert!(position.active);
+    assert_eq!(position.principal, 500_000);
+    assert_eq!(client.get_plan_yield_count(), 1);
+}
+
+#[test]
+fn test_unregister_requires_registration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral, admin) = setup(&env);
+
+    assert_eq!(
+        client.try_unregister_plan_yield(&admin, &77u64),
+        Err(Ok(LendingError::PlanYieldNotRegistered))
+    );
+}
+
+#[test]
+fn test_boost_raises_the_effective_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 10_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    let base_rate = client.get_plan_yield_rate(&1u64);
+    assert_eq!(base_rate, 675);
+
+    client.set_plan_yield_boost(&admin, &1u64, &325u32);
+    assert_eq!(client.get_plan_yield_rate(&1u64), 1_000);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+
+    // 1_000_000 at 1000bps for a year = 100_000.
+    assert_eq!(client.get_accrued_plan_yield(&1u64), 100_000);
+}
+
+#[test]
+fn test_boost_is_capped() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000u64);
+    client.set_plan_yield_boost(&admin, &1u64, &MAX_YIELD_BOOST_BPS);
+
+    assert_eq!(
+        client.try_set_plan_yield_boost(&admin, &1u64, &(MAX_YIELD_BOOST_BPS + 1)),
+        Err(Ok(LendingError::InvalidYieldBoost))
+    );
+}
+
+#[test]
+fn test_boost_survives_reregistration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000u64);
+    client.set_plan_yield_boost(&admin, &1u64, &500u32);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &2_000u64);
+
+    assert_eq!(
+        client.get_plan_yield_position(&1u64).unwrap().boost_bps,
+        500
+    );
+}
+
+#[test]
+fn test_simulate_and_project_agree() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    let projected = client.project_plan_yield(&1u64, &SECONDS_IN_YEAR);
+    let simulated = client.simulate_plan_yield(&1_000_000u64, &675u32, &SECONDS_IN_YEAR);
+    assert_eq!(projected, simulated);
+    assert_eq!(projected, 67_500);
+}
+
+#[test]
+fn test_projection_ignores_the_retained_yield_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    // Only 10 available, but the projection reports the full accrual.
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 10);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+
+    assert_eq!(client.project_plan_yield(&1u64, &SECONDS_IN_YEAR), 67_500);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+    assert_eq!(client.get_accrued_plan_yield(&1u64), 10);
+}
+
+#[test]
+fn test_simulate_plan_yield_zero_cases() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral, _admin) = setup(&env);
+
+    assert_eq!(
+        client.simulate_plan_yield(&0u64, &500u32, &SECONDS_IN_YEAR),
+        0
+    );
+    assert_eq!(
+        client.simulate_plan_yield(&1_000u64, &0u32, &SECONDS_IN_YEAR),
+        0
+    );
+    assert_eq!(client.simulate_plan_yield(&1_000u64, &500u32, &0u64), 0);
+}
+
+#[test]
+fn test_plan_yield_stats_aggregate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 4_000_000, 2_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+    client.register_plan_yield(&admin, &2u64, &token_addr, &500_000u64);
+    client.register_plan_yield(&admin, &3u64, &token_addr, &250_000u64);
+    client.unregister_plan_yield(&admin, &3u64);
+
+    let stats = client.get_plan_yield_stats(&token_addr);
+    assert_eq!(stats.asset, token_addr);
+    assert_eq!(stats.position_count, 3);
+    assert_eq!(stats.active_count, 2);
+    assert_eq!(stats.total_principal, 1_500_000);
+    assert_eq!(stats.available_yield, 1_000_000);
+}
+
+#[test]
+fn test_plan_yield_stats_counts_only_matching_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    let other = create_token_addr(&env);
+    client.add_asset_pool(&admin, &other, &500u32, &2000u32, &10000u32);
+
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000u64);
+    client.register_plan_yield(&admin, &2u64, &other, &9_000u64);
+
+    assert_eq!(client.get_plan_yield_stats(&token_addr).position_count, 1);
+    assert_eq!(client.get_plan_yield_stats(&other).total_principal, 9_000);
+}
+
+#[test]
+fn test_fund_retained_yield_moves_tokens_and_credits_pool() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    mint_to(&env, &token_addr, &admin, 500_000i128);
+    let pool_before = client.get_pool_state(&token_addr).retained_yield;
+
+    let new_balance = client.fund_retained_yield(&admin, &token_addr, &200_000u64);
+
+    assert_eq!(new_balance, pool_before + 200_000);
+    assert_eq!(
+        client.get_pool_state(&token_addr).retained_yield,
+        pool_before + 200_000
+    );
+    assert_eq!(tok_client(&env, &token_addr).balance(&admin), 300_000i128);
+}
+
+#[test]
+fn test_fund_retained_yield_rejects_zero_and_strangers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    assert_eq!(
+        client.try_fund_retained_yield(&admin, &token_addr, &0u64),
+        Err(Ok(LendingError::InvalidAmount))
+    );
+
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.try_fund_retained_yield(&stranger, &token_addr, &100u64),
+        Err(Ok(LendingError::Unauthorized))
+    );
+}
+
+#[test]
+fn test_funded_yield_becomes_harvestable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    // Utilization but an empty yield bucket: nothing is payable yet.
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 0);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+    assert_eq!(client.get_accrued_plan_yield(&1u64), 0);
+
+    mint_to(&env, &token_addr, &admin, 100_000i128);
+    client.fund_retained_yield(&admin, &token_addr, &100_000u64);
+
+    assert_eq!(client.get_accrued_plan_yield(&1u64), 67_500);
+    assert_eq!(client.claim_plan_yield(&admin, &1u64), 67_500);
+}
+
+#[test]
+fn test_claim_batch_returns_aligned_results() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 4_000_000, 2_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+    client.register_plan_yield(&admin, &2u64, &token_addr, &2_000_000u64);
+
+    let start = env.ledger().timestamp();
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+
+    let ids = soroban_sdk::vec![&env, 1u64, 2u64, 99u64];
+    let results = client.claim_plan_yield_batch(&admin, &ids);
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results.get(0).unwrap(), 67_500);
+    assert_eq!(results.get(1).unwrap(), 135_000);
+    // An unregistered plan yields 0 instead of reverting the batch.
+    assert_eq!(results.get(2).unwrap(), 0);
+}
+
+#[test]
+fn test_claim_batch_is_bounded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _token_addr, _collateral, admin) = setup(&env);
+
+    let mut ids = soroban_sdk::Vec::new(&env);
+    for i in 0..(MAX_YIELD_CLAIM_BATCH + 1) {
+        ids.push_back(i as u64);
+    }
+
+    assert_eq!(
+        client.try_claim_plan_yield_batch(&admin, &ids),
+        Err(Ok(LendingError::TooManyYieldPositions))
+    );
+}
+
+#[test]
+fn test_harvest_counters_advance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, token_addr, _collateral, admin) = setup(&env);
+
+    seed_yield_pool(&env, &client, &token_addr, 2_000_000, 1_000_000, 1_000_000);
+    client.register_plan_yield(&admin, &1u64, &token_addr, &1_000_000u64);
+    let start = env.ledger().timestamp();
+
+    env.ledger().set_timestamp(start + SECONDS_IN_YEAR);
+    client.claim_plan_yield(&admin, &1u64);
+    env.ledger().set_timestamp(start + 2 * SECONDS_IN_YEAR);
+    client.claim_plan_yield(&admin, &1u64);
+
+    let position = client.get_plan_yield_position(&1u64).unwrap();
+    assert_eq!(position.harvest_count, 2);
+    assert_eq!(position.last_harvest_amount, 67_500);
+    assert_eq!(position.total_harvested, 135_000);
+    assert_eq!(position.registered_at, start);
 }

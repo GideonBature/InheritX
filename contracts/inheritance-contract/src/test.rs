@@ -6,7 +6,7 @@ use mock_token::MockToken;
 use mock_token::MockTokenClient;
 use soroban_sdk::{
     testutils::Address as _, testutils::Events, testutils::Ledger, token, vec, Address, Bytes, Env,
-    String, Vec,
+    String, TryFromVal, Vec,
 };
 
 /// Test helper for balance and mint (uses mock-token crate client).
@@ -6461,4 +6461,1062 @@ fn test_link_leaves_peer_unset_when_version_check_fails() {
 
     assert!(result.is_err());
     assert_eq!(client.get_lending_contract(), None);
+}
+
+// ─────────────────────────────────────────────────
+// Automated Yield Harvest & Reinvestment
+// ─────────────────────────────────────────────────
+
+/// Minimal stand-in for the lending pool's yield surface.
+///
+/// The real pool lives in a separate cdylib crate, so the vault-side tests
+/// register this mock instead: it answers `get_version` (required by
+/// `set_lending_contract`) and the three yield entry points the vault calls.
+/// The pool's own accrual maths are covered by `lending-contract`'s tests.
+mod mock_pool {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum MockKey {
+        Accrued(u64),
+        Principal(u64),
+        Claims(u64),
+        Fail,
+    }
+
+    #[contract]
+    pub struct MockLendingPool;
+
+    #[contractimpl]
+    impl MockLendingPool {
+        pub fn get_version(_env: Env) -> u32 {
+            access_control::CONTRACT_VERSION
+        }
+
+        /// Seed the yield this mock will report as claimable.
+        pub fn set_accrued(env: Env, plan_id: u64, amount: u64) {
+            env.storage()
+                .instance()
+                .set(&MockKey::Accrued(plan_id), &amount);
+        }
+
+        /// Make every subsequent yield call trap, to exercise the vault's
+        /// cross-contract failure path.
+        pub fn set_failing(env: Env, failing: bool) {
+            env.storage().instance().set(&MockKey::Fail, &failing);
+        }
+
+        fn check_live(env: &Env) {
+            if env
+                .storage()
+                .instance()
+                .get::<MockKey, bool>(&MockKey::Fail)
+                .unwrap_or(false)
+            {
+                panic!("mock pool unavailable");
+            }
+        }
+
+        pub fn register_plan_yield(
+            env: Env,
+            caller: Address,
+            plan_id: u64,
+            _asset: Address,
+            principal: u64,
+        ) {
+            Self::check_live(&env);
+            caller.require_auth();
+            env.storage()
+                .instance()
+                .set(&MockKey::Principal(plan_id), &principal);
+        }
+
+        pub fn get_registered_principal(env: Env, plan_id: u64) -> u64 {
+            env.storage()
+                .instance()
+                .get(&MockKey::Principal(plan_id))
+                .unwrap_or(0)
+        }
+
+        pub fn get_accrued_plan_yield(env: Env, plan_id: u64) -> u64 {
+            Self::check_live(&env);
+            env.storage()
+                .instance()
+                .get(&MockKey::Accrued(plan_id))
+                .unwrap_or(0)
+        }
+
+        pub fn claim_plan_yield(env: Env, caller: Address, plan_id: u64) -> u64 {
+            Self::check_live(&env);
+            caller.require_auth();
+            let amount: u64 = env
+                .storage()
+                .instance()
+                .get(&MockKey::Accrued(plan_id))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&MockKey::Accrued(plan_id), &0u64);
+            let claims: u32 = env
+                .storage()
+                .instance()
+                .get(&MockKey::Claims(plan_id))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&MockKey::Claims(plan_id), &(claims + 1));
+            amount
+        }
+
+        pub fn unregister_plan_yield(env: Env, caller: Address, plan_id: u64) {
+            Self::check_live(&env);
+            caller.require_auth();
+            env.storage()
+                .instance()
+                .set(&MockKey::Principal(plan_id), &0u64);
+        }
+
+        pub fn get_claim_count(env: Env, plan_id: u64) -> u32 {
+            env.storage()
+                .instance()
+                .get(&MockKey::Claims(plan_id))
+                .unwrap_or(0)
+        }
+    }
+}
+
+use mock_pool::{MockLendingPool, MockLendingPoolClient};
+
+/// Creates a KYC'd owner with an active, yield-enabled plan and a mock pool
+/// linked to the vault. Returns (client, admin, owner, plan_id, pool client).
+fn setup_yield_plan(
+    env: &Env,
+) -> (
+    InheritanceContractClient<'_>,
+    Address,
+    Address,
+    u64,
+    MockLendingPoolClient<'_>,
+) {
+    let (client, token_id, admin, owner) = setup_with_token_and_admin(env);
+
+    let params = plan_params(
+        env,
+        &owner,
+        &token_id,
+        "Yield Plan",
+        "Compounding vault",
+        1_000_000u64,
+        DistributionMethod::LumpSum,
+        &default_beneficiaries(env),
+    );
+    let plan_id = client.create_inheritance_plan(&params);
+
+    // Opt the plan into yield earning.
+    client.update_plan(&owner, &plan_id, &default_beneficiaries(env), &0u64, &true);
+
+    let pool_id = env.register_contract(None, MockLendingPool);
+    let pool = MockLendingPoolClient::new(env, &pool_id);
+    client.set_lending_contract(&admin, &pool_id);
+
+    (client, admin, owner, plan_id, pool)
+}
+
+#[test]
+fn test_relayer_registration_roundtrip() {
+    let env = Env::default();
+    let (client, admin, _owner, _plan_id, _pool) = setup_yield_plan(&env);
+
+    let relayer = Address::generate(&env);
+    assert!(!client.is_yield_relayer(&relayer));
+
+    client.add_yield_relayer(&admin, &relayer);
+    assert!(client.is_yield_relayer(&relayer));
+    assert_eq!(client.get_yield_relayers().len(), 1);
+
+    // Re-adding is a no-op, not an error.
+    client.add_yield_relayer(&admin, &relayer);
+    assert_eq!(client.get_yield_relayers().len(), 1);
+
+    client.remove_yield_relayer(&admin, &relayer);
+    assert!(!client.is_yield_relayer(&relayer));
+    assert_eq!(client.get_yield_relayers().len(), 0);
+}
+
+#[test]
+fn test_remove_unknown_relayer_errors() {
+    let env = Env::default();
+    let (client, admin, _owner, _plan_id, _pool) = setup_yield_plan(&env);
+
+    let stranger = Address::generate(&env);
+    let result = client.try_remove_yield_relayer(&admin, &stranger);
+    assert_eq!(result, Err(Ok(InheritanceError::Unauthorized)));
+}
+
+#[test]
+fn test_relayer_cap_is_enforced() {
+    let env = Env::default();
+    let (client, admin, _owner, _plan_id, _pool) = setup_yield_plan(&env);
+
+    for _ in 0..MAX_YIELD_RELAYERS {
+        client.add_yield_relayer(&admin, &Address::generate(&env));
+    }
+    let overflow = Address::generate(&env);
+    let result = client.try_add_yield_relayer(&admin, &overflow);
+    assert_eq!(result, Err(Ok(InheritanceError::TooManyBeneficiaries)));
+}
+
+#[test]
+fn test_register_yield_position_sends_unencumbered_principal() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert_eq!(
+        pool.get_registered_principal(&plan_id),
+        plan.total_amount - plan.total_loaned
+    );
+    assert_eq!(client.get_yield_asset(&plan_id), Some(asset));
+    assert_eq!(
+        client.get_last_yield_harvest(&plan_id),
+        env.ledger().timestamp()
+    );
+}
+
+#[test]
+fn test_harvest_yield_compounds_into_total_amount() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+
+    let before = client.get_plan_details(&plan_id).unwrap().total_amount;
+    pool.set_accrued(&plan_id, &5_000u64);
+
+    let harvested = client.harvest_yield(&owner, &plan_id);
+    assert_eq!(harvested, 5_000);
+
+    let after = client.get_plan_details(&plan_id).unwrap().total_amount;
+    assert_eq!(after, before + 5_000);
+    assert_eq!(client.get_total_yield_harvested(&plan_id), 5_000);
+}
+
+#[test]
+fn test_harvest_yield_accumulates_lifetime_total() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+    let before = client.get_plan_details(&plan_id).unwrap().total_amount;
+
+    pool.set_accrued(&plan_id, &1_000u64);
+    client.harvest_yield(&owner, &plan_id);
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 86_400);
+    pool.set_accrued(&plan_id, &2_500u64);
+    client.harvest_yield(&owner, &plan_id);
+
+    assert_eq!(client.get_total_yield_harvested(&plan_id), 3_500);
+    assert_eq!(
+        client.get_plan_details(&plan_id).unwrap().total_amount,
+        before + 3_500
+    );
+    assert_eq!(
+        client.get_last_yield_harvest(&plan_id),
+        env.ledger().timestamp()
+    );
+}
+
+#[test]
+fn test_harvest_yield_emits_event() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+    let before = client.get_plan_details(&plan_id).unwrap().total_amount;
+    pool.set_accrued(&plan_id, &7_777u64);
+
+    client.harvest_yield(&owner, &plan_id);
+
+    let expected = YieldHarvestedEvent {
+        plan_id,
+        yield_amount: 7_777,
+        new_total_amount: before + 7_777,
+        harvested_at: env.ledger().timestamp(),
+    };
+    let found = env.events().all().iter().any(|(contract, topics, data)| {
+        contract == client.address
+            && topics == (symbol_short!("YIELD"), symbol_short!("HARVEST")).into_val(&env)
+            && YieldHarvestedEvent::try_from_val(&env, &data).as_ref() == Ok(&expected)
+    });
+    assert!(found, "YIELD/HARVEST event was not published");
+}
+
+#[test]
+fn test_harvest_yield_allows_admin_and_relayer() {
+    let env = Env::default();
+    let (client, admin, owner, plan_id, pool) = setup_yield_plan(&env);
+
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+
+    pool.set_accrued(&plan_id, &100u64);
+    assert_eq!(client.harvest_yield(&admin, &plan_id), 100);
+
+    let relayer = Address::generate(&env);
+    client.add_yield_relayer(&admin, &relayer);
+    pool.set_accrued(&plan_id, &200u64);
+    assert_eq!(client.harvest_yield(&relayer, &plan_id), 200);
+
+    assert_eq!(pool.get_claim_count(&plan_id), 2);
+}
+
+#[test]
+fn test_harvest_yield_rejects_unauthorized_caller() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+    pool.set_accrued(&plan_id, &500u64);
+
+    let stranger = Address::generate(&env);
+    let result = client.try_harvest_yield(&stranger, &plan_id);
+    assert_eq!(result, Err(Ok(InheritanceError::Unauthorized)));
+
+    // Nothing was claimed on the pool side.
+    assert_eq!(pool.get_claim_count(&plan_id), 0);
+}
+
+#[test]
+fn test_harvest_yield_rejects_revoked_relayer() {
+    let env = Env::default();
+    let (client, admin, owner, plan_id, pool) = setup_yield_plan(&env);
+
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+
+    let relayer = Address::generate(&env);
+    client.add_yield_relayer(&admin, &relayer);
+    client.remove_yield_relayer(&admin, &relayer);
+
+    pool.set_accrued(&plan_id, &500u64);
+    let result = client.try_harvest_yield(&relayer, &plan_id);
+    assert_eq!(result, Err(Ok(InheritanceError::Unauthorized)));
+}
+
+#[test]
+fn test_harvest_yield_requires_plan_to_exist() {
+    let env = Env::default();
+    let (client, _admin, owner, _plan_id, _pool) = setup_yield_plan(&env);
+
+    let result = client.try_harvest_yield(&owner, &9_999u64);
+    assert_eq!(result, Err(Ok(InheritanceError::PlanNotFound)));
+}
+
+#[test]
+fn test_harvest_yield_when_earn_yield_disabled() {
+    let env = Env::default();
+    let (client, token_id, admin, owner) = setup_with_token_and_admin(&env);
+
+    let params = plan_params(
+        &env,
+        &owner,
+        &token_id,
+        "No Yield",
+        "Plain vault",
+        500_000u64,
+        DistributionMethod::LumpSum,
+        &default_beneficiaries(&env),
+    );
+    let plan_id = client.create_inheritance_plan(&params);
+
+    let pool_id = env.register_contract(None, MockLendingPool);
+    client.set_lending_contract(&admin, &pool_id);
+
+    // earn_yield defaults to false on creation.
+    let result = client.try_harvest_yield(&owner, &plan_id);
+    assert_eq!(result, Err(Ok(InheritanceError::PlanNotActive)));
+}
+
+#[test]
+fn test_harvest_yield_with_nothing_accrued() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, _pool) = setup_yield_plan(&env);
+
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+
+    let result = client.try_harvest_yield(&owner, &plan_id);
+    assert_eq!(result, Err(Ok(InheritanceError::NothingToClaim)));
+}
+
+#[test]
+fn test_harvest_yield_without_registered_position() {
+    let env = Env::default();
+    let (client, token_id, admin, owner) = setup_with_token_and_admin(&env);
+
+    let params = plan_params(
+        &env,
+        &owner,
+        &token_id,
+        "Orphan Plan",
+        "No pool linked",
+        500_000u64,
+        DistributionMethod::LumpSum,
+        &default_beneficiaries(&env),
+    );
+    let plan_id = client.create_inheritance_plan(&params);
+    client.update_plan(&owner, &plan_id, &default_beneficiaries(&env), &0u64, &true);
+    let _ = admin;
+
+    // The local yield record is checked before the pool is called, so an
+    // unregistered plan reports PlanNotFound rather than reaching out.
+    let result = client.try_harvest_yield(&owner, &plan_id);
+    assert_eq!(result, Err(Ok(InheritanceError::PlanNotFound)));
+}
+
+#[test]
+fn test_harvest_yield_surfaces_pool_failure() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+    pool.set_accrued(&plan_id, &1_000u64);
+    pool.set_failing(&true);
+
+    let result = client.try_harvest_yield(&owner, &plan_id);
+    assert_eq!(result, Err(Ok(InheritanceError::FeeTransferFailed)));
+
+    // The plan balance is untouched when the pool call fails.
+    assert_eq!(client.get_total_yield_harvested(&plan_id), 0);
+}
+
+#[test]
+fn test_get_pending_yield_reads_through_to_pool() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+
+    assert_eq!(client.get_pending_yield(&plan_id), 0);
+    pool.set_accrued(&plan_id, &4_242u64);
+    assert_eq!(client.get_pending_yield(&plan_id), 4_242);
+}
+
+// ─────────────────────────────────────────────────
+// Yield config, pausing, fees, batching, projections
+// ─────────────────────────────────────────────────
+
+#[test]
+fn test_default_yield_config_compounds_everything() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, _pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    let config = client.get_yield_config(&plan_id).unwrap();
+    assert!(config.auto_compound);
+    assert_eq!(config.min_harvest_amount, 0);
+    assert_eq!(config.harvest_interval, 0);
+    assert_eq!(config.performance_fee_bp, 0);
+}
+
+#[test]
+fn test_set_yield_config_roundtrip() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, _pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    client.set_yield_config(&owner, &plan_id, &false, &500u64, &3_600u64, &250u32);
+
+    let config = client.get_yield_config(&plan_id).unwrap();
+    assert!(!config.auto_compound);
+    assert_eq!(config.min_harvest_amount, 500);
+    assert_eq!(config.harvest_interval, 3_600);
+    assert_eq!(config.performance_fee_bp, 250);
+}
+
+#[test]
+fn test_set_yield_config_rejects_excessive_fee() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, _pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    let result = client.try_set_yield_config(&owner, &plan_id, &true, &0u64, &0u64, &5_001u32);
+    assert_eq!(result, Err(Ok(InheritanceError::InvalidAllocation)));
+}
+
+#[test]
+fn test_relayer_cannot_change_yield_config() {
+    let env = Env::default();
+    let (client, admin, owner, plan_id, _pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    let relayer = Address::generate(&env);
+    client.add_yield_relayer(&admin, &relayer);
+
+    // A relayer may pull the harvest lever but not reprice it.
+    let result = client.try_set_yield_config(&relayer, &plan_id, &true, &0u64, &0u64, &1_000u32);
+    assert_eq!(result, Err(Ok(InheritanceError::Unauthorized)));
+}
+
+#[test]
+fn test_performance_fee_is_withheld_from_compounding() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    // 10% performance fee.
+    client.set_yield_config(&owner, &plan_id, &true, &0u64, &0u64, &1_000u32);
+
+    let before = client.get_plan_details(&plan_id).unwrap().total_amount;
+    pool.set_accrued(&plan_id, &10_000u64);
+
+    // The gross is reported; only the net is compounded.
+    assert_eq!(client.harvest_yield(&owner, &plan_id), 10_000);
+    assert_eq!(
+        client.get_plan_details(&plan_id).unwrap().total_amount,
+        before + 9_000
+    );
+    assert_eq!(client.get_total_yield_fees(&plan_id), 1_000);
+    assert_eq!(client.get_total_yield_harvested(&plan_id), 10_000);
+}
+
+#[test]
+fn test_preview_harvest_split_matches_execution() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+    client.set_yield_config(&owner, &plan_id, &true, &0u64, &0u64, &1_000u32);
+
+    let (net, fee) = client.preview_harvest_split(&plan_id, &10_000u64);
+    assert_eq!((net, fee), (9_000, 1_000));
+
+    let before = client.get_plan_details(&plan_id).unwrap().total_amount;
+    pool.set_accrued(&plan_id, &10_000u64);
+    client.harvest_yield(&owner, &plan_id);
+
+    assert_eq!(
+        client.get_plan_details(&plan_id).unwrap().total_amount,
+        before + net
+    );
+    assert_eq!(client.get_total_yield_fees(&plan_id), fee);
+}
+
+#[test]
+fn test_harvest_interval_enforces_cooldown() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+    client.set_yield_config(&owner, &plan_id, &true, &0u64, &3_600u64, &0u32);
+
+    // The cooldown runs from registration, so the first harvest waits too.
+    pool.set_accrued(&plan_id, &1_000u64);
+    assert_eq!(
+        client.try_harvest_yield(&owner, &plan_id),
+        Err(Ok(InheritanceError::EmergencyCooldownActive))
+    );
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3_600);
+    client.harvest_yield(&owner, &plan_id);
+
+    // Still inside the cooldown window.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1_800);
+    pool.set_accrued(&plan_id, &1_000u64);
+    assert_eq!(
+        client.try_harvest_yield(&owner, &plan_id),
+        Err(Ok(InheritanceError::EmergencyCooldownActive))
+    );
+
+    // Past it, the harvest goes through.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1_800);
+    assert_eq!(client.harvest_yield(&owner, &plan_id), 1_000);
+}
+
+#[test]
+fn test_min_harvest_amount_skips_dust() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+    client.set_yield_config(&owner, &plan_id, &true, &1_000u64, &0u64, &0u32);
+
+    pool.set_accrued(&plan_id, &999u64);
+    assert_eq!(
+        client.try_harvest_yield(&owner, &plan_id),
+        Err(Ok(InheritanceError::NothingToClaim))
+    );
+    // Nothing was claimed on the pool side — the dust stays accruing.
+    assert_eq!(pool.get_claim_count(&plan_id), 0);
+
+    pool.set_accrued(&plan_id, &1_000u64);
+    assert_eq!(client.harvest_yield(&owner, &plan_id), 1_000);
+}
+
+#[test]
+fn test_manual_compounding_parks_yield_as_credit() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+    client.set_yield_config(&owner, &plan_id, &false, &0u64, &0u64, &0u32);
+
+    let before = client.get_plan_details(&plan_id).unwrap().total_amount;
+    pool.set_accrued(&plan_id, &4_000u64);
+    client.harvest_yield(&owner, &plan_id);
+
+    // Balance unchanged; the yield waits in pending credit.
+    assert_eq!(
+        client.get_plan_details(&plan_id).unwrap().total_amount,
+        before
+    );
+    assert_eq!(client.get_pending_credit(&plan_id), 4_000);
+    assert_eq!(client.get_total_plan_value(&plan_id), before + 4_000);
+
+    assert_eq!(client.compound_pending_yield(&owner, &plan_id), 4_000);
+    assert_eq!(
+        client.get_plan_details(&plan_id).unwrap().total_amount,
+        before + 4_000
+    );
+    assert_eq!(client.get_pending_credit(&plan_id), 0);
+}
+
+#[test]
+fn test_compound_pending_requires_something_pending() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, _pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    assert_eq!(
+        client.try_compound_pending_yield(&owner, &plan_id),
+        Err(Ok(InheritanceError::NothingToClaim))
+    );
+}
+
+#[test]
+fn test_pause_and_resume_plan_yield() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    assert!(!client.is_plan_yield_paused(&plan_id));
+    client.pause_plan_yield(&owner, &plan_id);
+    assert!(client.is_plan_yield_paused(&plan_id));
+
+    pool.set_accrued(&plan_id, &1_000u64);
+    assert_eq!(
+        client.try_harvest_yield(&owner, &plan_id),
+        Err(Ok(InheritanceError::PlanNotActive))
+    );
+
+    client.resume_plan_yield(&owner, &plan_id);
+    assert!(!client.is_plan_yield_paused(&plan_id));
+    assert_eq!(client.harvest_yield(&owner, &plan_id), 1_000);
+}
+
+#[test]
+fn test_harvest_history_records_each_harvest() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+    client.set_yield_config(&owner, &plan_id, &true, &0u64, &0u64, &1_000u32);
+
+    pool.set_accrued(&plan_id, &10_000u64);
+    client.harvest_yield(&owner, &plan_id);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 86_400);
+    pool.set_accrued(&plan_id, &20_000u64);
+    client.harvest_yield(&owner, &plan_id);
+
+    let history = client.get_yield_history(&plan_id);
+    assert_eq!(history.len(), 2);
+
+    let first = history.get(0).unwrap();
+    assert_eq!(first.gross_amount, 10_000);
+    assert_eq!(first.net_amount, 9_000);
+    assert_eq!(first.fee_amount, 1_000);
+    assert_eq!(first.harvested_by, owner);
+    assert!(first.compounded);
+
+    assert_eq!(history.get(1).unwrap().gross_amount, 20_000);
+    assert_eq!(client.get_yield_harvest_count(&plan_id), 2);
+}
+
+#[test]
+fn test_harvest_history_is_bounded() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    for i in 1..=(MAX_YIELD_HISTORY + 5) {
+        env.ledger().set_timestamp(env.ledger().timestamp() + 60);
+        pool.set_accrued(&plan_id, &(i as u64 * 100));
+        client.harvest_yield(&owner, &plan_id);
+    }
+
+    let history = client.get_yield_history(&plan_id);
+    assert_eq!(history.len(), MAX_YIELD_HISTORY);
+    // The oldest entries were evicted; the newest survives.
+    assert_eq!(
+        history.get(MAX_YIELD_HISTORY - 1).unwrap().gross_amount,
+        (MAX_YIELD_HISTORY + 5) as u64 * 100
+    );
+    assert_eq!(
+        client.get_yield_harvest_count(&plan_id),
+        MAX_YIELD_HISTORY + 5
+    );
+}
+
+#[test]
+fn test_yield_summary_reports_position() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+    client.set_yield_config(&owner, &plan_id, &true, &0u64, &3_600u64, &1_000u32);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3_600);
+    pool.set_accrued(&plan_id, &10_000u64);
+    client.harvest_yield(&owner, &plan_id);
+
+    let summary = client.get_yield_summary(&plan_id);
+    assert_eq!(summary.plan_id, plan_id);
+    assert_eq!(summary.asset, asset);
+    assert_eq!(summary.total_harvested, 10_000);
+    assert_eq!(summary.total_fees_paid, 1_000);
+    assert_eq!(summary.harvest_count, 1);
+    assert_eq!(summary.last_harvest_amount, 10_000);
+    assert_eq!(summary.last_harvest_at, env.ledger().timestamp());
+    assert_eq!(summary.next_harvest_at, env.ledger().timestamp() + 3_600);
+    assert!(!summary.paused);
+    assert!(summary.auto_compound);
+}
+
+#[test]
+fn test_yield_summary_requires_registration() {
+    let env = Env::default();
+    let (client, _admin, _owner, plan_id, _pool) = setup_yield_plan(&env);
+
+    assert_eq!(
+        client.try_get_yield_summary(&plan_id),
+        Err(Ok(InheritanceError::PlanNotFound))
+    );
+}
+
+#[test]
+fn test_is_harvest_due_tracks_cooldown_and_floor() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+    client.set_yield_config(&owner, &plan_id, &true, &1_000u64, &3_600u64, &0u32);
+
+    // Nothing accrued yet.
+    assert!(!client.is_harvest_due(&plan_id));
+
+    // Accrued but below the floor and inside the cooldown.
+    pool.set_accrued(&plan_id, &500u64);
+    assert!(!client.is_harvest_due(&plan_id));
+
+    // Above the floor, but still on cooldown.
+    pool.set_accrued(&plan_id, &2_000u64);
+    assert!(!client.is_harvest_due(&plan_id));
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3_600);
+    assert!(client.is_harvest_due(&plan_id));
+
+    client.pause_plan_yield(&owner, &plan_id);
+    assert!(!client.is_harvest_due(&plan_id));
+}
+
+#[test]
+fn test_is_harvest_due_false_for_unregistered_plan() {
+    let env = Env::default();
+    let (client, _admin, _owner, plan_id, _pool) = setup_yield_plan(&env);
+    assert!(!client.is_harvest_due(&plan_id));
+}
+
+#[test]
+fn test_next_harvest_at_reflects_interval() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, _pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    // Zero interval: eligible immediately.
+    assert_eq!(
+        client.get_next_harvest_at(&plan_id),
+        client.get_last_yield_harvest(&plan_id)
+    );
+
+    client.set_yield_config(&owner, &plan_id, &true, &0u64, &7_200u64, &0u32);
+    assert_eq!(
+        client.get_next_harvest_at(&plan_id),
+        client.get_last_yield_harvest(&plan_id) + 7_200
+    );
+}
+
+#[test]
+fn test_batch_harvest_sweeps_many_plans() {
+    let env = Env::default();
+    let (client, admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    let relayer = Address::generate(&env);
+    client.add_yield_relayer(&admin, &relayer);
+
+    let before = client.get_plan_details(&plan_id).unwrap().total_amount;
+    pool.set_accrued(&plan_id, &3_000u64);
+
+    // plan_id harvests; the unregistered ids are skipped, not fatal.
+    let ids = vec![&env, plan_id, 900u64, 901u64];
+    let (success, fail, total) = client.harvest_yield_batch(&relayer, &ids);
+
+    assert_eq!(success, 1);
+    assert_eq!(fail, 2);
+    assert_eq!(total, 3_000);
+    assert_eq!(
+        client.get_plan_details(&plan_id).unwrap().total_amount,
+        before + 3_000
+    );
+}
+
+#[test]
+fn test_batch_harvest_skips_paused_plans() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+    client.pause_plan_yield(&owner, &plan_id);
+
+    pool.set_accrued(&plan_id, &3_000u64);
+    let (success, fail, total) = client.harvest_yield_batch(&owner, &vec![&env, plan_id]);
+
+    assert_eq!((success, fail, total), (0, 1, 0));
+}
+
+#[test]
+fn test_batch_harvest_is_bounded() {
+    let env = Env::default();
+    let (client, _admin, owner, _plan_id, _pool) = setup_yield_plan(&env);
+
+    let mut ids = Vec::new(&env);
+    for i in 0..(MAX_YIELD_BATCH + 1) {
+        ids.push_back(i as u64);
+    }
+
+    assert_eq!(
+        client.try_harvest_yield_batch(&owner, &ids),
+        Err(Ok(InheritanceError::TooManyBeneficiaries))
+    );
+}
+
+#[test]
+fn test_sync_yield_principal_reuses_stored_asset() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+
+    let synced = client.sync_yield_principal(&owner, &plan_id);
+    let plan = client.get_plan_details(&plan_id).unwrap();
+
+    assert_eq!(synced, plan.total_amount - plan.total_loaned);
+    assert_eq!(pool.get_registered_principal(&plan_id), synced);
+    assert_eq!(client.get_yield_asset(&plan_id), Some(asset));
+}
+
+#[test]
+fn test_unregister_compounds_pending_credit_first() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+    client.set_yield_config(&owner, &plan_id, &false, &0u64, &0u64, &0u32);
+
+    let before = client.get_plan_details(&plan_id).unwrap().total_amount;
+    pool.set_accrued(&plan_id, &2_500u64);
+    client.harvest_yield(&owner, &plan_id);
+    assert_eq!(client.get_pending_credit(&plan_id), 2_500);
+
+    client.unregister_yield_position(&owner, &plan_id);
+
+    // The parked credit landed in the plan rather than being discarded.
+    assert_eq!(
+        client.get_plan_details(&plan_id).unwrap().total_amount,
+        before + 2_500
+    );
+    assert!(client.get_yield_state_of(&plan_id).is_none());
+}
+
+#[test]
+fn test_reregistering_preserves_lifetime_totals() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    let asset = Address::generate(&env);
+    client.register_yield_position(&owner, &plan_id, &asset);
+
+    pool.set_accrued(&plan_id, &1_500u64);
+    client.harvest_yield(&owner, &plan_id);
+
+    client.register_yield_position(&owner, &plan_id, &asset);
+
+    assert_eq!(client.get_total_yield_harvested(&plan_id), 1_500);
+    assert_eq!(client.get_yield_harvest_count(&plan_id), 1);
+    assert_eq!(client.get_yield_history(&plan_id).len(), 1);
+}
+
+// ─── Projections ─────────────────────────────
+
+#[test]
+fn test_project_plan_balance_grows_with_horizon() {
+    let env = Env::default();
+    let (client, _admin, _owner, plan_id, _pool) = setup_yield_plan(&env);
+    let principal = client.get_plan_details(&plan_id).unwrap().total_amount;
+
+    let month = client.project_plan_balance(&plan_id, &500u32, &30u64);
+    let year = client.project_plan_balance(&plan_id, &500u32, &365u64);
+
+    assert!(month > principal);
+    assert!(year > month);
+}
+
+#[test]
+fn test_project_plan_interest_excludes_principal() {
+    let env = Env::default();
+    let (client, _admin, _owner, plan_id, _pool) = setup_yield_plan(&env);
+    let principal = client.get_plan_details(&plan_id).unwrap().total_amount;
+
+    let balance = client.project_plan_balance(&plan_id, &500u32, &365u64);
+    let interest = client.project_plan_interest(&plan_id, &500u32, &365u64);
+
+    assert_eq!(interest, balance - principal);
+}
+
+#[test]
+fn test_projection_rejects_absurd_inputs() {
+    let env = Env::default();
+    let (client, _admin, _owner, plan_id, _pool) = setup_yield_plan(&env);
+
+    assert_eq!(
+        client.try_project_plan_balance(&plan_id, &10_001u32, &30u64),
+        Err(Ok(InheritanceError::InvalidAllocation))
+    );
+    assert_eq!(
+        client.try_project_plan_balance(&plan_id, &500u32, &36_501u64),
+        Err(Ok(InheritanceError::InvalidAllocation))
+    );
+}
+
+#[test]
+fn test_effective_apy_exceeds_nominal() {
+    let env = Env::default();
+    let (client, _admin, _owner, _plan_id, _pool) = setup_yield_plan(&env);
+
+    assert!(client.effective_apy(&500u32) > 500);
+    assert_eq!(client.effective_apy(&0u32), 0);
+}
+
+#[test]
+fn test_compound_helpers_are_exposed() {
+    let env = Env::default();
+    let (client, _admin, _owner, _plan_id, _pool) = setup_yield_plan(&env);
+
+    // (1.1)^10 on 1_000_000
+    assert_eq!(
+        client.compute_compound_amount(&1_000_000u64, &1_000u32, &10u64),
+        2_593_742
+    );
+    assert_eq!(
+        client.compute_compound_interest(&1_000_000u64, &1_000u32, &10u64),
+        1_593_742
+    );
+    assert_eq!(client.compute_daily_rate_bps(&3_650u32), 10);
+    assert_eq!(client.compute_periods_elapsed(&(86_400 * 3)), 3);
+}
+
+#[test]
+fn test_blended_rate_weights_by_principal() {
+    let env = Env::default();
+    let (client, _admin, _owner, _plan_id, _pool) = setup_yield_plan(&env);
+
+    assert_eq!(
+        client.compute_blended_rate(&1_000u64, &400u32, &1_000u64, &600u32),
+        500
+    );
+    assert_eq!(
+        client.compute_blended_rate(&0u64, &400u32, &0u64, &600u32),
+        0
+    );
+}
+
+#[test]
+fn test_estimate_next_harvest_amount() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, _pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    let principal = client.get_yield_summary(&plan_id).registered_principal;
+    // 5% of principal over a full year.
+    assert_eq!(
+        client.estimate_next_harvest_amount(&plan_id, &500u32, &31_536_000u64),
+        principal / 20
+    );
+}
+
+#[test]
+fn test_days_since_last_harvest() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, _pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    assert_eq!(client.days_since_last_harvest(&plan_id), 0);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 86_400 * 3 + 10);
+    assert_eq!(client.days_since_last_harvest(&plan_id), 3);
+}
+
+#[test]
+fn test_realized_yield_rate_reflects_actual_harvests() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    // No harvests yet.
+    assert_eq!(client.realized_yield_rate_bps(&plan_id), 0);
+
+    let principal = client.get_yield_summary(&plan_id).registered_principal;
+    pool.set_accrued(&plan_id, &1u64);
+    client.harvest_yield(&owner, &plan_id);
+
+    // A full year later, harvest 5% of principal.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 31_536_000);
+    pool.set_accrued(&plan_id, &(principal / 20));
+    client.harvest_yield(&owner, &plan_id);
+
+    let realized = client.realized_yield_rate_bps(&plan_id);
+    assert!((495..=505).contains(&realized), "got {realized}");
+}
+
+#[test]
+fn test_plan_pool_share_bps() {
+    let env = Env::default();
+    let (client, _admin, owner, plan_id, _pool) = setup_yield_plan(&env);
+    client.register_yield_position(&owner, &plan_id, &Address::generate(&env));
+
+    let principal = client.get_yield_summary(&plan_id).registered_principal;
+    assert_eq!(
+        client.compute_plan_pool_share_bps(&plan_id, &principal),
+        10_000
+    );
+    assert_eq!(
+        client.compute_plan_pool_share_bps(&plan_id, &(principal * 4)),
+        2_500
+    );
+    assert_eq!(client.compute_plan_pool_share_bps(&plan_id, &0u64), 0);
 }

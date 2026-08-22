@@ -25,6 +25,11 @@ const LIQUIDATION_THRESHOLD_BPS: u32 = 15000; // 150% liquidation threshold in b
 const DEFAULT_INSURANCE_PREMIUM_RATE_BPS: u32 = 200; // 2% premium of loan principal
 const CONTRACT_VERSION: u32 = 1; // Contract version for upgrade tracking
 
+// Plan yield constants
+const MAX_YIELD_BOOST_BPS: u32 = 2_000; // 20% additional rate, absolute ceiling
+const MAX_PLAN_YIELD_POSITIONS: u32 = 200; // Bounds the index scan
+const MAX_YIELD_CLAIM_BATCH: u32 = 25; // Bounds one batch claim
+
 // ─────────────────────────────────────────────────
 // Data Types
 // ─────────────────────────────────────────────────
@@ -45,6 +50,44 @@ pub struct PoolState {
     pub reserve_factor_bps: u32, // Reserve factor in basis points (e.g., 1000 = 10%)
     pub total_protocol_revenue: u64, // Total protocol revenue accumulated
     pub is_paused: bool,     // Per-asset pause functionality
+}
+
+/// Yield-bearing position held by an inheritance plan in this pool.
+///
+/// Registered by the linked inheritance contract when a plan opts into
+/// yield earning. `principal` is the plan balance considered to be earning
+/// the pool's supply rate; `last_harvest_at` is the accrual watermark, so
+/// each harvest only pays for time elapsed since the previous one.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanYieldPosition {
+    pub plan_id: u64,
+    pub asset: Address,
+    pub principal: u64,
+    pub last_harvest_at: u64,
+    pub total_harvested: u64,
+    pub last_harvest_amount: u64,
+    pub harvest_count: u32,
+    pub registered_at: u64,
+    /// Extra rate, in basis points, granted on top of the pool supply rate.
+    /// Lets the protocol incentivize long-horizon inheritance deposits without
+    /// distorting the rate every other depositor sees.
+    pub boost_bps: u32,
+    /// Cleared by `unregister_plan_yield`. An inactive position stops accruing
+    /// but keeps its lifetime totals for accounting.
+    pub active: bool,
+}
+
+/// Aggregate view of every plan position in one asset's pool.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanYieldStats {
+    pub asset: Address,
+    pub position_count: u32,
+    pub active_count: u32,
+    pub total_principal: u64,
+    pub total_harvested: u64,
+    pub available_yield: u64,
 }
 
 const SECONDS_IN_YEAR: u64 = 31_536_000;
@@ -357,6 +400,51 @@ pub struct RewardsClaimedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanYieldRegisteredEvent {
+    pub plan_id: u64,
+    pub asset: Address,
+    pub principal: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanYieldUnregisteredEvent {
+    pub plan_id: u64,
+    pub asset: Address,
+    pub total_harvested: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanYieldBoostSetEvent {
+    pub plan_id: u64,
+    pub old_boost_bps: u32,
+    pub new_boost_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedYieldFundedEvent {
+    pub asset: Address,
+    pub funder: Address,
+    pub amount: u64,
+    pub new_balance: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanYieldClaimedEvent {
+    pub plan_id: u64,
+    pub asset: Address,
+    pub yield_amount: u64,
+    pub total_harvested: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RewardRateUpdatedEvent {
     pub asset: Address,
     pub old_rate: u64,
@@ -477,6 +565,11 @@ pub enum LendingError {
     InvalidInsuranceAmount = 31,
     InvalidRateModel = 32,
     ContractPaused = 33,
+    PlanYieldNotRegistered = 34,
+    NoYieldAccrued = 35,
+    PlanYieldInactive = 36,
+    InvalidYieldBoost = 37,
+    TooManyYieldPositions = 38,
 }
 
 impl From<LendingError> for soroban_sdk::Error {
@@ -529,6 +622,11 @@ impl TryFrom<soroban_sdk::Error> for LendingError {
             31 => Ok(LendingError::InvalidInsuranceAmount),
             32 => Ok(LendingError::InvalidRateModel),
             33 => Ok(LendingError::ContractPaused),
+            34 => Ok(LendingError::PlanYieldNotRegistered),
+            35 => Ok(LendingError::NoYieldAccrued),
+            36 => Ok(LendingError::PlanYieldInactive),
+            37 => Ok(LendingError::InvalidYieldBoost),
+            38 => Ok(LendingError::TooManyYieldPositions),
             _ => Err(err),
         }
     }
@@ -580,6 +678,8 @@ pub enum DataKey {
     Token,                             // Underlying token address for insurance operations
     WhitelistedFlashReceiver(Address), // Approved flash loan receiver contracts
     Version,                           // Contract version (u32)
+    PlanYield(u64),                    // plan_id -> PlanYieldPosition
+    PlanYieldIndex,                    // Vec<u64> of every registered plan_id
 }
 
 // ─────────────────────────────────────────────────
@@ -3893,6 +3993,539 @@ impl LendingContract {
 
     pub fn get_governance_contract(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::GovernanceContract)
+    }
+
+    // ─── Plan Yield Harvesting ───────────────────────
+
+    /// Authorize a caller for plan-yield operations.
+    ///
+    /// Accepts either the linked inheritance contract (which authorizes
+    /// itself when it invokes this contract as a sub-invocation) or a
+    /// protocol admin, so the pool side can be driven directly during
+    /// migrations without going through the vault.
+    fn require_plan_yield_caller(env: &Env, caller: &Address) -> Result<(), LendingError> {
+        caller.require_auth();
+        Self::check_plan_yield_caller(env, caller)
+    }
+
+    /// The authorization half of [`Self::require_plan_yield_caller`], without
+    /// the `require_auth` call.
+    ///
+    /// Split out because Soroban rejects a second `require_auth` for the same
+    /// address in one frame — batch entry points authorize once up front and
+    /// then check each plan with this.
+    fn check_plan_yield_caller(env: &Env, caller: &Address) -> Result<(), LendingError> {
+        if Self::get_inheritance_contract(env.clone()).as_ref() == Some(caller) {
+            return Ok(());
+        }
+        access_control::require_role(env, caller, Role::Admin, LendingError::Unauthorized)
+    }
+
+    /// Supply-side rate for `asset`, in basis points per year.
+    ///
+    /// Mirrors `get_supply_rate` but resolves the pool per asset instead of
+    /// the single bootstrap token, so multi-asset pools accrue correctly.
+    fn supply_rate_bps_for(env: &Env, asset: &Address) -> Result<u32, LendingError> {
+        let pool = Self::get_pool(env, asset)?;
+        let utilization_bps = Self::get_utilization_bps(pool.total_borrowed, pool.total_deposits);
+
+        let model = env
+            .storage()
+            .instance()
+            .get::<DataKey, RateModel>(&DataKey::RateModel);
+
+        let (borrow_rate, reserve_factor) = match &model {
+            Some(m) => (
+                Self::two_slope_rate(m, utilization_bps),
+                m.reserve_factor_bps,
+            ),
+            None => (
+                Self::calculate_dynamic_rate(
+                    pool.base_rate_bps,
+                    pool.multiplier_bps,
+                    utilization_bps,
+                ),
+                pool.reserve_factor_bps,
+            ),
+        };
+
+        // supply_rate = borrow_rate * utilization * (10000 - reserve_factor) / 10000^2
+        let supply_rate = (borrow_rate as u128)
+            .checked_mul(utilization_bps as u128)
+            .and_then(|v| v.checked_mul((10000u32.saturating_sub(reserve_factor)) as u128))
+            .and_then(|v| v.checked_div(10000u128 * 10000u128))
+            .unwrap_or(0);
+
+        Ok(supply_rate as u32)
+    }
+
+    /// Interest accrued by a position since its watermark, simple pro-rata:
+    /// `principal * supply_rate_bps * elapsed / (10000 * SECONDS_IN_YEAR)`.
+    ///
+    /// All intermediates are u128 and checked; any overflow degrades to 0
+    /// rather than trapping, so a harvest can never brick a plan.
+    fn accrued_for_position(env: &Env, position: &PlanYieldPosition) -> Result<u64, LendingError> {
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(position.last_harvest_at);
+        if elapsed == 0 || position.principal == 0 || !position.active {
+            return Ok(0);
+        }
+
+        let rate_bps =
+            Self::supply_rate_bps_for(env, &position.asset)?.saturating_add(position.boost_bps);
+        if rate_bps == 0 {
+            return Ok(0);
+        }
+
+        let accrued = (position.principal as u128)
+            .checked_mul(rate_bps as u128)
+            .and_then(|v| v.checked_mul(elapsed as u128))
+            .and_then(|v| v.checked_div(10000u128 * SECONDS_IN_YEAR as u128))
+            .unwrap_or(0);
+
+        Ok(u64::try_from(accrued).unwrap_or(u64::MAX))
+    }
+
+    /// Register (or re-register) an inheritance plan's yield-bearing principal.
+    ///
+    /// Re-registering resets the accrual watermark to now, so a principal
+    /// change never retroactively re-prices already-elapsed time. Callers that
+    /// care about pending interest should harvest before re-registering.
+    pub fn register_plan_yield(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+        asset: Address,
+        principal: u64,
+    ) -> Result<(), LendingError> {
+        Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
+        Self::require_plan_yield_caller(&env, &caller)?;
+
+        // Fails with AssetNotSupported if the asset has no pool.
+        Self::get_pool(&env, &asset)?;
+
+        let now = env.ledger().timestamp();
+        let existing = env
+            .storage()
+            .persistent()
+            .get::<DataKey, PlanYieldPosition>(&DataKey::PlanYield(plan_id));
+
+        let position = match existing {
+            // Re-registering keeps lifetime totals and any boost; only the
+            // asset, principal, and accrual watermark move.
+            Some(mut prior) => {
+                prior.asset = asset.clone();
+                prior.principal = principal;
+                prior.last_harvest_at = now;
+                prior.active = true;
+                prior
+            }
+            None => {
+                Self::index_plan_yield(&env, plan_id)?;
+                PlanYieldPosition {
+                    plan_id,
+                    asset: asset.clone(),
+                    principal,
+                    last_harvest_at: now,
+                    total_harvested: 0,
+                    last_harvest_amount: 0,
+                    harvest_count: 0,
+                    registered_at: now,
+                    boost_bps: 0,
+                    active: true,
+                }
+            }
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlanYield(plan_id), &position);
+
+        env.events().publish(
+            (symbol_short!("PLANYLD"), symbol_short!("REGISTER")),
+            PlanYieldRegisteredEvent {
+                plan_id,
+                asset,
+                principal,
+                timestamp: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Read the stored yield position for a plan, if any.
+    pub fn get_plan_yield_position(env: Env, plan_id: u64) -> Option<PlanYieldPosition> {
+        env.storage().persistent().get(&DataKey::PlanYield(plan_id))
+    }
+
+    /// Preview the yield a plan would harvest right now, without mutating state.
+    ///
+    /// The returned figure is already capped by the pool's `retained_yield`,
+    /// so it matches what `claim_plan_yield` would actually pay out.
+    pub fn get_accrued_plan_yield(env: Env, plan_id: u64) -> Result<u64, LendingError> {
+        Self::require_initialized(&env)?;
+        let position: PlanYieldPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlanYield(plan_id))
+            .ok_or(LendingError::PlanYieldNotRegistered)?;
+
+        let accrued = Self::accrued_for_position(&env, &position)?;
+        let pool = Self::get_pool(&env, &position.asset)?;
+        Ok(accrued.min(pool.retained_yield))
+    }
+
+    /// Claim the yield accrued by a plan's position and advance its watermark.
+    ///
+    /// The payout is drawn from the pool's `retained_yield` bucket and capped
+    /// by it, so a harvest can never mint value the pool has not earned. The
+    /// underlying tokens stay in the pool: the inheritance contract compounds
+    /// the returned amount into the plan's locked balance rather than moving
+    /// funds out.
+    pub fn claim_plan_yield(env: Env, caller: Address, plan_id: u64) -> Result<u64, LendingError> {
+        caller.require_auth();
+        Self::claim_plan_yield_inner(&env, &caller, plan_id)
+    }
+
+    fn claim_plan_yield_inner(
+        env: &Env,
+        caller: &Address,
+        plan_id: u64,
+    ) -> Result<u64, LendingError> {
+        let env = env.clone();
+        Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
+        Self::check_plan_yield_caller(&env, caller)?;
+
+        let mut position: PlanYieldPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlanYield(plan_id))
+            .ok_or(LendingError::PlanYieldNotRegistered)?;
+
+        if !position.active {
+            return Err(LendingError::PlanYieldInactive);
+        }
+
+        let mut pool = Self::get_pool(&env, &position.asset)?;
+        if pool.is_paused {
+            return Err(LendingError::PoolPaused);
+        }
+
+        let accrued = Self::accrued_for_position(&env, &position)?;
+        let payout = accrued.min(pool.retained_yield);
+        if payout == 0 {
+            return Err(LendingError::NoYieldAccrued);
+        }
+
+        pool.retained_yield = pool.retained_yield.saturating_sub(payout);
+        Self::set_pool(&env, &position.asset, &pool);
+
+        let now = env.ledger().timestamp();
+        position.last_harvest_at = now;
+        position.last_harvest_amount = payout;
+        position.harvest_count = position.harvest_count.saturating_add(1);
+        position.total_harvested = position.total_harvested.saturating_add(payout);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlanYield(plan_id), &position);
+
+        env.events().publish(
+            (symbol_short!("PLANYLD"), symbol_short!("CLAIM")),
+            PlanYieldClaimedEvent {
+                plan_id,
+                asset: position.asset.clone(),
+                yield_amount: payout,
+                total_harvested: position.total_harvested,
+                timestamp: now,
+            },
+        );
+
+        log!(&env, "Plan {} harvested {} yield", plan_id, payout);
+
+        Ok(payout)
+    }
+
+    /// Add a plan to the registry index, bounded by
+    /// [`MAX_PLAN_YIELD_POSITIONS`] so the aggregate scan stays cheap.
+    fn index_plan_yield(env: &Env, plan_id: u64) -> Result<(), LendingError> {
+        let mut index: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlanYieldIndex)
+            .unwrap_or_else(|| Vec::new(env));
+
+        if index.contains(plan_id) {
+            return Ok(());
+        }
+        if index.len() >= MAX_PLAN_YIELD_POSITIONS {
+            return Err(LendingError::TooManyYieldPositions);
+        }
+
+        index.push_back(plan_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::PlanYieldIndex, &index);
+        Ok(())
+    }
+
+    /// Every plan id that has ever registered a position, active or not.
+    pub fn get_registered_plan_ids(env: Env) -> Vec<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PlanYieldIndex)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Number of registered plan positions.
+    pub fn get_plan_yield_count(env: Env) -> u32 {
+        Self::get_registered_plan_ids(env).len()
+    }
+
+    /// Deactivate a plan's position so it stops accruing.
+    ///
+    /// Lifetime totals and the index entry survive, so historical accounting
+    /// stays intact and a later `register_plan_yield` reactivates in place
+    /// rather than double-counting a new entry.
+    pub fn unregister_plan_yield(
+        env: Env,
+        caller: Address,
+        plan_id: u64,
+    ) -> Result<(), LendingError> {
+        Self::require_initialized(&env)?;
+        Self::require_plan_yield_caller(&env, &caller)?;
+
+        let mut position: PlanYieldPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlanYield(plan_id))
+            .ok_or(LendingError::PlanYieldNotRegistered)?;
+
+        position.active = false;
+        position.principal = 0;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlanYield(plan_id), &position);
+
+        env.events().publish(
+            (symbol_short!("PLANYLD"), symbol_short!("UNREG")),
+            PlanYieldUnregisteredEvent {
+                plan_id,
+                asset: position.asset.clone(),
+                total_harvested: position.total_harvested,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Grant a plan extra rate on top of the pool supply rate. Admin only.
+    ///
+    /// Capped at [`MAX_YIELD_BOOST_BPS`]. A boost still draws from the same
+    /// `retained_yield` bucket, so it can raise what a plan is owed but never
+    /// what the pool can actually pay.
+    pub fn set_plan_yield_boost(
+        env: Env,
+        admin: Address,
+        plan_id: u64,
+        boost_bps: u32,
+    ) -> Result<(), LendingError> {
+        Self::require_initialized(&env)?;
+        Self::require_admin(&env, &admin)?;
+
+        if boost_bps > MAX_YIELD_BOOST_BPS {
+            return Err(LendingError::InvalidYieldBoost);
+        }
+
+        let mut position: PlanYieldPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlanYield(plan_id))
+            .ok_or(LendingError::PlanYieldNotRegistered)?;
+
+        let old_boost_bps = position.boost_bps;
+        position.boost_bps = boost_bps;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PlanYield(plan_id), &position);
+
+        env.events().publish(
+            (symbol_short!("PLANYLD"), symbol_short!("BOOST")),
+            PlanYieldBoostSetEvent {
+                plan_id,
+                old_boost_bps,
+                new_boost_bps: boost_bps,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// The effective annual rate for a plan: pool supply rate plus its boost.
+    pub fn get_plan_yield_rate(env: Env, plan_id: u64) -> Result<u32, LendingError> {
+        Self::require_initialized(&env)?;
+        let position: PlanYieldPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlanYield(plan_id))
+            .ok_or(LendingError::PlanYieldNotRegistered)?;
+
+        Ok(Self::supply_rate_bps_for(&env, &position.asset)?.saturating_add(position.boost_bps))
+    }
+
+    /// Project what a position would accrue over `horizon_secs` at its current
+    /// effective rate, ignoring the `retained_yield` cap.
+    ///
+    /// A forecast for planning, not a claimable figure — use
+    /// `get_accrued_plan_yield` for what is actually payable now.
+    pub fn project_plan_yield(
+        env: Env,
+        plan_id: u64,
+        horizon_secs: u64,
+    ) -> Result<u64, LendingError> {
+        Self::require_initialized(&env)?;
+        let position: PlanYieldPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlanYield(plan_id))
+            .ok_or(LendingError::PlanYieldNotRegistered)?;
+
+        let rate = Self::get_plan_yield_rate(env.clone(), plan_id)?;
+        Ok(Self::simulate_plan_yield(
+            env,
+            position.principal,
+            rate,
+            horizon_secs,
+        ))
+    }
+
+    /// Pure pro-rata accrual, exposed so callers run the same maths the pool
+    /// does instead of reimplementing it.
+    pub fn simulate_plan_yield(env: Env, principal: u64, rate_bps: u32, elapsed_secs: u64) -> u64 {
+        let _ = env;
+        let accrued = (principal as u128)
+            .checked_mul(rate_bps as u128)
+            .and_then(|v| v.checked_mul(elapsed_secs as u128))
+            .and_then(|v| v.checked_div(10000u128 * SECONDS_IN_YEAR as u128))
+            .unwrap_or(0);
+        u64::try_from(accrued).unwrap_or(u64::MAX)
+    }
+
+    /// Aggregate position stats for one asset's pool.
+    pub fn get_plan_yield_stats(env: Env, asset: Address) -> Result<PlanYieldStats, LendingError> {
+        Self::require_initialized(&env)?;
+        let pool = Self::get_pool(&env, &asset)?;
+
+        let mut position_count = 0u32;
+        let mut active_count = 0u32;
+        let mut total_principal = 0u64;
+        let mut total_harvested = 0u64;
+
+        for plan_id in Self::get_registered_plan_ids(env.clone()).iter() {
+            if let Some(position) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, PlanYieldPosition>(&DataKey::PlanYield(plan_id))
+            {
+                if position.asset != asset {
+                    continue;
+                }
+                position_count += 1;
+                if position.active {
+                    active_count += 1;
+                    total_principal = total_principal.saturating_add(position.principal);
+                }
+                total_harvested = total_harvested.saturating_add(position.total_harvested);
+            }
+        }
+
+        Ok(PlanYieldStats {
+            asset,
+            position_count,
+            active_count,
+            total_principal,
+            total_harvested,
+            available_yield: pool.retained_yield,
+        })
+    }
+
+    /// Top up the bucket harvests are paid from, moving `amount` of the asset
+    /// from the funder into the pool.
+    ///
+    /// Real transfer, not a bookkeeping bump: the tokens back the credit the
+    /// pool is about to owe out. Admin or the linked vault only.
+    pub fn fund_retained_yield(
+        env: Env,
+        funder: Address,
+        asset: Address,
+        amount: u64,
+    ) -> Result<u64, LendingError> {
+        Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
+        Self::require_plan_yield_caller(&env, &funder)?;
+
+        if amount == 0 {
+            return Err(LendingError::InvalidAmount);
+        }
+
+        let mut pool = Self::get_pool(&env, &asset)?;
+        Self::transfer(
+            &env,
+            &asset,
+            &funder,
+            &env.current_contract_address(),
+            amount,
+        )?;
+
+        pool.retained_yield = pool
+            .retained_yield
+            .checked_add(amount)
+            .ok_or(LendingError::InvalidAmount)?;
+        Self::set_pool(&env, &asset, &pool);
+
+        env.events().publish(
+            (symbol_short!("PLANYLD"), symbol_short!("FUND")),
+            RetainedYieldFundedEvent {
+                asset,
+                funder,
+                amount,
+                new_balance: pool.retained_yield,
+            },
+        );
+
+        Ok(pool.retained_yield)
+    }
+
+    /// Claim yield for several plans in one call.
+    ///
+    /// A plan with nothing accrued yields 0 rather than reverting the batch,
+    /// so one idle position cannot block a keeper's sweep. Results are
+    /// positionally aligned with `plan_ids`.
+    pub fn claim_plan_yield_batch(
+        env: Env,
+        caller: Address,
+        plan_ids: Vec<u64>,
+    ) -> Result<Vec<u64>, LendingError> {
+        Self::require_initialized(&env)?;
+        Self::require_not_paused(&env)?;
+
+        if plan_ids.len() > MAX_YIELD_CLAIM_BATCH {
+            return Err(LendingError::TooManyYieldPositions);
+        }
+
+        // Authorize once: Soroban rejects a repeat `require_auth` for the same
+        // address within a frame, so the loop uses the unauthenticated inner.
+        caller.require_auth();
+
+        let mut results: Vec<u64> = Vec::new(&env);
+        for plan_id in plan_ids.iter() {
+            let claimed = Self::claim_plan_yield_inner(&env, &caller, plan_id).unwrap_or(0);
+            results.push_back(claimed);
+        }
+
+        Ok(results)
     }
 
     // ─── Interest Rate Model ─────────────────────────
