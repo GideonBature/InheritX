@@ -98,10 +98,13 @@ export class PlansAPI {
    * Get a specific plan by ID
    */
   async getPlan(planId: string): Promise<Plan> {
-    const response = await apiClient.get<ApiResponse<Plan>>(
+    const response = await apiClient.get<ApiResponse<Plan> | Plan>(
       `/api/plans/${planId}`
     );
-    return response.data!;
+    if (response && typeof response === "object" && "data" in response) {
+      return response.data!;
+    }
+    return response as Plan;
   }
 
   /**
@@ -242,7 +245,7 @@ export class PlansAPI {
    */
   async getPlansByOwner(ownerAddress: string): Promise<Plan[]> {
     const response = await apiClient.get<ApiResponse<Plan[]> | Plan[]>(
-      `/api/plans?owner=${ownerAddress}`
+      `/api/plans?owner=${encodeURIComponent(ownerAddress)}`
     );
     if (response && typeof response === "object" && "data" in response) {
       return response.data as Plan[];

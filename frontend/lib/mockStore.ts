@@ -111,7 +111,7 @@ export const mockStore = {
   createPlan(plan: Partial<MockPlan>): MockPlan {
     const plans = this.getPlans();
     const newPlan: MockPlan = {
-      id: `plan_${Math.random().toString(36).substr(2, 9)}`,
+      id: `plan_${globalThis.crypto.randomUUID()}`,
       user_id: "user_logged_in",
       owner_address: plan.owner_address || "GDRT7YV3XP9P...8K2M",
       token_address: plan.token_address || "USDC",

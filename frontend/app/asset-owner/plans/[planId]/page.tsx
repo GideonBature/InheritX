@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { plansAPI, type Plan } from "@/app/lib/api/plans";
+import { getPlan } from "@/lib/api/dataSource";
 import {
   ArrowLeft,
   FileText,
@@ -73,13 +74,17 @@ export default function PlanDetailPage() {
 
   useEffect(() => {
     if (!planId) return;
-    const mockPlan = require("@/lib/mockStore").mockStore.getPlan(planId);
-    if (mockPlan) {
-      setPlan(mockPlan);
-    } else {
-      setError("Plan not found");
-    }
-    setLoading(false);
+    let cancelled = false;
+    setLoading(true);
+    getPlan(planId)
+      .then((nextPlan) => {
+        if (cancelled) return;
+        if (nextPlan) setPlan(nextPlan);
+        else setError("Plan not found");
+      })
+      .catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load plan."); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, [planId]);
 
   if (loading) {

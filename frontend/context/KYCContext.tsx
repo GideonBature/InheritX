@@ -2,6 +2,8 @@
 
 import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
 import { kycAPI, type KYCStatus, type KYCResponse } from "@/app/lib/api/kyc";
+import { useWallet } from "./WalletContext";
+import { getKYCStatus, useMockData } from "@/lib/api/dataSource";
 
 export type { KYCStatus };
 
@@ -74,6 +76,7 @@ export const useKYC = () => {
 };
 
 export const KYCProvider = ({ children }: { children: React.ReactNode }) => {
+  const { address } = useWallet();
   const [isKYCModalOpen, setIsKYCModalOpen] = useState(false);
   const [kycStatus, setKycStatus] = useState<KYCStatus>("pending");
   const [kycResponse, setKycResponse] = useState<KYCResponse | null>(null);
@@ -83,21 +86,22 @@ export const KYCProvider = ({ children }: { children: React.ReactNode }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Load persisted KYC status on mount and poll for updates
+  // Load status for the connected wallet and revalidate it while the app is open.
   useEffect(() => {
     const loadKYCStatus = async () => {
       try {
         setIsLoading(true);
-        const status = require("@/lib/mockStore").mockStore.getKYCStatus() as KYCStatus;
-        setKycStatus(status);
-        setKycResponse({
-          wallet_address: "GDE2KZQ4QGJZ5Z5QW2Y4B7Y6Q5D3P9V8N7M6L5K4J3H2G1FTEST",
-          kyc_status: status,
-          submitted_at: new Date().toISOString(),
-        });
+        if (!address && !useMockData) {
+          setKycResponse(null);
+          setKycStatus("pending");
+          return;
+        }
+        const response = await getKYCStatus(address ?? undefined);
+        setKycResponse(response);
+        setKycStatus(response.kyc_status);
         setError(null);
       } catch (err) {
-        console.error("Failed to load KYC status:", err);
+        setError(err instanceof Error ? err.message : "Failed to load KYC status.");
       } finally {
         setIsLoading(false);
       }
@@ -105,19 +109,10 @@ export const KYCProvider = ({ children }: { children: React.ReactNode }) => {
 
     loadKYCStatus();
 
-    // Poll mockStore for updates
-    const pollInterval = setInterval(() => {
-      const status = require("@/lib/mockStore").mockStore.getKYCStatus() as KYCStatus;
-      setKycStatus(status);
-      setKycResponse({
-        wallet_address: "GDE2KZQ4QGJZ5Z5QW2Y4B7Y6Q5D3P9V8N7M6L5K4J3H2G1FTEST",
-        kyc_status: status,
-        submitted_at: new Date().toISOString(),
-      });
-    }, 5000);
+    const pollInterval = setInterval(loadKYCStatus, 5000);
 
     return () => clearInterval(pollInterval);
-  }, [kycStatus]);
+  }, [address]);
 
   const openKYCModal = () => setIsKYCModalOpen(true);
   const closeKYCModal = () => setIsKYCModalOpen(false);
@@ -150,20 +145,31 @@ export const KYCProvider = ({ children }: { children: React.ReactNode }) => {
     setIsSubmitting(true);
     setError(null);
     try {
-      const mockStore = require("@/lib/mockStore").mockStore;
-      mockStore.setKYCStatus("pending");
-      setKycStatus("pending");
-      setKycResponse({
-        wallet_address: "GDE2KZQ4QGJZ5Z5QW2Y4B7Y6Q5D3P9V8N7M6L5K4J3H2G1FTEST",
-        kyc_status: "pending",
-        submitted_at: new Date().toISOString(),
-      });
-
-      // Automatically approve after 8 seconds for nice user feedback
-      setTimeout(() => {
-        mockStore.setKYCStatus("approved");
-        setKycStatus("approved");
-      }, 8000);
+      if (useMockData) {
+        const mockStore = require("@/lib/mockStore").mockStore;
+        mockStore.setKYCStatus("pending");
+        setKycStatus("pending");
+        setTimeout(() => {
+          mockStore.setKYCStatus("approved");
+          setKycStatus("approved");
+        }, 8000);
+      } else {
+        await kycAPI.submitKYC({
+          wallet_address: address ?? "",
+          full_name: formData.fullName,
+          email: formData.email,
+          date_of_birth: formData.dateOfBirth,
+          nationality: formData.nationality,
+          id_type: formData.idType,
+          id_number: formData.idNumber,
+          expiry_date: formData.expiryDate,
+          street_address: formData.streetAddress,
+          city: formData.city,
+          country: formData.country,
+          postal_code: formData.postalCode,
+        });
+        await refreshKYCStatus();
+      }
 
       setTimeout(() => {
         closeKYCModal();
@@ -181,7 +187,7 @@ export const KYCProvider = ({ children }: { children: React.ReactNode }) => {
   const refreshKYCStatus = useCallback(async () => {
     try {
       setIsLoading(true);
-      const response = await kycAPI.getKYCStatus();
+      const response = await getKYCStatus(address ?? undefined);
       setKycResponse(response);
       setKycStatus(response.kyc_status);
       setError(null);
@@ -192,7 +198,7 @@ export const KYCProvider = ({ children }: { children: React.ReactNode }) => {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [address]);
 
   const canCreatePlan = kycStatus === "approved";
 

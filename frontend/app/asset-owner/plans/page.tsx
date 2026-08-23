@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { useWallet } from "@/context/WalletContext";
 import { plansAPI, type Plan } from "@/app/lib/api/plans";
+import { getPlans } from "@/lib/api/dataSource";
 import {
   PlusCircle,
   Search,
@@ -158,18 +159,20 @@ export default function PlansPage() {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All");
   const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const fetchPlans = useCallback(async () => {
     try {
-      const mockPlans = require("@/lib/mockStore").mockStore.getPlans();
-      setPlans(mockPlans);
-    } catch {
+      setPlans(await getPlans(address ?? undefined));
+      setError(null);
+    } catch (err) {
       setPlans([]);
+      setError(err instanceof Error ? err.message : "Failed to load plans.");
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [address]);
 
   useEffect(() => { fetchPlans(); }, [fetchPlans]);
 
@@ -211,6 +214,7 @@ export default function PlansPage() {
       </div>
 
       {/* Filters */}
+      {error && <div role="alert" className="rounded-xl border border-red-500/20 bg-red-500/5 p-4 text-xs text-red-300">{error}</div>}
       <div className="flex flex-col sm:flex-row gap-3">
         <div className="relative flex-1">
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />

@@ -32,29 +32,33 @@ export interface KYCResponse {
 }
 
 export interface KYCSubmissionRequest {
-  fullName: string;
+  wallet_address: string;
+  full_name: string;
   email: string;
-  dateOfBirth: string;
+  date_of_birth: string;
   nationality: string;
-  idType: string;
-  idNumber: string;
-  expiryDate: string;
-  streetAddress: string;
+  id_type: string;
+  id_number: string;
+  expiry_date: string;
+  street_address: string;
   city: string;
   country: string;
-  postalCode: string;
-  documentId?: string; // Reference to uploaded document
+  postal_code: string;
+  document_id?: string;
 }
 
 export class KycAPI {
   /**
    * Get current user's KYC status
    */
-  async getKYCStatus(): Promise<KYCResponse> {
+  async getKYCStatus(walletAddress?: string): Promise<KYCResponse> {
+    const query = walletAddress
+      ? `?wallet_address=${encodeURIComponent(walletAddress)}`
+      : "";
     const response = await apiClient.get<ApiResponse<KYCResponse>>(
-      "/api/kyc/status"
+      `/api/kyc/status${query}`
     );
-    return response.data!;
+    return response.data ?? (response as unknown as KYCResponse);
   }
 
   /**

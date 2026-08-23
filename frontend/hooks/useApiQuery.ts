@@ -10,6 +10,7 @@ interface UseApiQueryOptions<T> {
   enabled?: boolean;
   onSuccess?: (data: T[]) => void;
   onError?: (error: Error) => void;
+  refreshInterval?: number;
 }
 
 interface ApiResponse<T> {
@@ -26,7 +27,7 @@ interface ApiResponse<T> {
 }
 
 export function useApiQuery<T = any>(options: UseApiQueryOptions<T>) {
-  const { endpoint, initialParams, enabled = true, onSuccess, onError } = options;
+  const { endpoint, initialParams, enabled = true, onSuccess, onError, refreshInterval } = options;
 
   const [data, setData] = useState<T[]>([]);
   const [loading, setLoading] = useState(false);
@@ -60,15 +61,17 @@ export function useApiQuery<T = any>(options: UseApiQueryOptions<T>) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const result: ApiResponse<T> = await response.json();
+      const result: ApiResponse<T> | T[] = await response.json();
+      const payload = Array.isArray(result) ? result : result.data;
+      if (!payload) throw new Error("API response did not contain data");
       
-      setData(result.data);
-      if (result.pagination) {
+      setData(payload);
+      if (!Array.isArray(result) && result.pagination) {
         setPagination(result.pagination);
       }
 
       if (onSuccess) {
-        onSuccess(result.data);
+        onSuccess(payload);
       }
     } catch (err) {
       const error = err instanceof Error ? err : new Error("Unknown error");
@@ -83,7 +86,10 @@ export function useApiQuery<T = any>(options: UseApiQueryOptions<T>) {
 
   useEffect(() => {
     fetchData();
-  }, [fetchData]);
+    if (!refreshInterval || refreshInterval <= 0) return;
+    const interval = window.setInterval(fetchData, refreshInterval);
+    return () => window.clearInterval(interval);
+  }, [fetchData, refreshInterval]);
 
   // Filter methods
   const setFilter = useCallback((key: string, value: any) => {

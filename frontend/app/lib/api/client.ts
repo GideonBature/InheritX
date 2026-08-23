@@ -128,7 +128,9 @@ export class ApiClient {
     const exponentialDelay = config.baseDelayMs * Math.pow(2, attempt);
     const cappedDelay = Math.min(exponentialDelay, config.maxDelayMs);
     // Full jitter: random value between 0 and cappedDelay
-    return Math.random() * cappedDelay;
+    const randomBytes = new Uint32Array(1);
+    globalThis.crypto?.getRandomValues(randomBytes);
+    return ((randomBytes[0] ?? 0) / 0xffffffff) * cappedDelay;
   }
 
   /**

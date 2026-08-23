@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { useRouter, useParams } from "next/navigation";
 import { plansAPI } from "@/app/lib/api/plans";
 import type { Plan } from "@/app/lib/api/plans";
+import { getPlan, useMockData } from "@/lib/api/dataSource";
 import { EditInheritancePlanPanel } from "@/components/plans/EditInheritancePlanPanel";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { AlertCircle } from "lucide-react";
@@ -19,21 +20,26 @@ export default function EditPlanPage() {
 
   useEffect(() => {
     if (!planId) return;
-    const mockPlan = require("@/lib/mockStore").mockStore.getPlan(planId);
-    if (mockPlan) {
-      setPlan(mockPlan);
-    } else {
-      setError("Plan not found.");
-    }
-    setLoading(false);
+    getPlan(planId)
+      .then((nextPlan) => {
+        if (nextPlan) setPlan(nextPlan);
+        else setError("Plan not found.");
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : "Failed to load plan."))
+      .finally(() => setLoading(false));
   }, [planId]);
 
   const handleClose = () => router.back();
 
   const handleSaved = (updated: Plan) => {
-    require("@/lib/mockStore").mockStore.updatePlan(planId, updated);
-    setPlan(updated);
-    router.back();
+    const save = useMockData
+      ? Promise.resolve(updated)
+      : plansAPI.updatePlan(planId, updated);
+    save.then((savedPlan) => {
+      if (useMockData) require("@/lib/mockStore").mockStore.updatePlan(planId, savedPlan);
+      setPlan(savedPlan);
+      router.back();
+    }).catch((err) => setError(err instanceof Error ? err.message : "Failed to save plan."));
   };
 
   if (loading) {

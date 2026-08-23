@@ -219,7 +219,7 @@ class NotificationService {
     rendered: { subject?: string; title: string; body: string },
     template: any
   ): Notification {
-    const id = `notif_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const id = `notif_${globalThis.crypto.randomUUID()}`;
 
     return {
       id,

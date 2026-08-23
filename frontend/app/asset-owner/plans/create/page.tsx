@@ -13,6 +13,7 @@ import {
   Wallet,
 } from "lucide-react";
 import inheritanceAPI from "@/app/lib/api/inheritance";
+import { useMockData } from "@/lib/api/dataSource";
 import type { PlanBeneficiaryRequest } from "@/app/lib/api/inheritance";
 import {
   getSelectedTokenIdentifier,
@@ -175,20 +176,31 @@ export default function CreateInheritancePlanPage() {
     setSubmissionState("submitting");
 
     try {
-      // Create local mock plan in mockStore
-      const newPlan = require("@/lib/mockStore").mockStore.createPlan({
-        owner_address: hydratedDraft.owner,
-        token_address: selectedToken,
-        amount: Number(hydratedDraft.amount),
-        grace_period_seconds: (hydratedDraft.gracePeriodDays ?? 30) * 86400,
-        earn_yield: hydratedDraft.earnYield,
-        yield_rate_bps: 500, // 5% APY default
-        beneficiaries: buildBeneficiaries().map((b: any) => ({
-          wallet_address: b.address,
-          allocation_bps: b.allocation_bps,
-          fiat_anchor_info: "anchor-ngn",
-        })),
-      });
+      const newPlan = useMockData
+        ? require("@/lib/mockStore").mockStore.createPlan({
+            owner_address: hydratedDraft.owner,
+            token_address: selectedToken,
+            amount: Number(hydratedDraft.amount),
+            grace_period_seconds: (hydratedDraft.gracePeriodDays ?? 30) * 86400,
+            earn_yield: hydratedDraft.earnYield,
+            yield_rate_bps: 500,
+            beneficiaries: buildBeneficiaries().map((b) => ({
+              wallet_address: b.address,
+              allocation_bps: b.allocation_bps,
+              fiat_anchor_info: b.fiat_anchor_info,
+            })),
+          })
+        : await inheritanceAPI.createPlan({
+            owner: hydratedDraft.owner,
+            token: selectedToken,
+            amount: Number(hydratedDraft.amount),
+            beneficiaries: buildBeneficiaries(),
+            last_ping: Math.floor(Date.now() / 1000),
+            grace_period: (hydratedDraft.gracePeriodDays ?? 30) * 86400,
+            earn_yield: hydratedDraft.earnYield,
+            yield_rate_bps: 500,
+            is_active: true,
+          });
 
       setCreatedPlanId(newPlan.id);
       setSubmissionState("success");
