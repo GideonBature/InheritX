@@ -521,7 +521,6 @@ async fn invalidate_plan_cache(
 }
 
 // Handler: Create Plan
-// Contributors: Implement saving plan to database, set default fields, and run in a transaction
 async fn create_plan(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Plan>,
@@ -744,7 +743,6 @@ async fn create_plan(
 }
 
 // Handler: Update Plan
-// Contributors: Implement plan update with beneficiary allocation_bps validation
 async fn update_plan(
     State(state): State<Arc<AppState>>,
     Path(plan_id): Path<uuid::Uuid>,
@@ -978,7 +976,6 @@ async fn update_plan(
 }
 
 // Handler: Get Plans
-// Contributors: Implement plan retrieval, filtering by owner, and apply on-the-fly yield accumulation
 async fn get_plans(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PlanQuery>,
@@ -1177,7 +1174,6 @@ fn verify_ping_signature(_owner: &str, signature: &str, _message: &str) -> bool 
 }
 
 // Handler: Ping Plan
-// Contributors: Implement resetting last_ping timestamp and calculating accrued yield up to the ping time
 async fn ping_plan(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<PingRequest>,
@@ -1214,7 +1210,7 @@ async fn ping_plan(
                 .into_response();
         }
     };
-    // 3. Calculate accumulated yield
+    // 3. Calculate accumulated yield up to the ping time
     let current_time = chrono::Utc::now().timestamp();
     let elapsed = if current_time > plan.last_ping {
         (current_time - plan.last_ping) as u64
@@ -1232,17 +1228,56 @@ async fn ping_plan(
         }
     }
 
-    // 4. Update plans in PostgreSQL
+    // 4. Update last_ping timestamp and accrued yield; inactivity_deadline_at is
+    //    a generated column (last_ping + grace_period_seconds) and updates automatically.
+    let mut tx = match state.db_pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Failed to begin transaction: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
     if let Err(e) = sqlx::query("UPDATE plans SET last_ping = $1, accrued_yield = $2 WHERE id = $3")
         .bind(current_time)
         .bind(new_accrued_yield)
         .bind(plan.id)
-        .execute(&state.db_pool)
+        .execute(&mut *tx)
         .await
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("Failed to update plan: {}", e) })),
+        )
+            .into_response();
+    }
+
+    // 5. Insert ping audit record into ping_logs
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO ping_logs (plan_id, pinged_at, accrued_yield_snapshot)
+        VALUES ($1, NOW(), $2)
+        "#,
+    )
+    .bind(plan.id)
+    .bind(new_accrued_yield)
+    .execute(&mut *tx)
+    .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to record ping log: {}", e) })),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = tx.commit().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to commit transaction: {}", e) })),
         )
             .into_response();
     }
@@ -1265,7 +1300,7 @@ async fn ping_plan(
     )
     .await;
 
-    // 5. Return updated plan status and virtual balance
+    // 6. Return updated plan status and virtual balance
     let virtual_balance = plan.amount + new_accrued_yield;
     (
         StatusCode::OK,
@@ -1278,8 +1313,6 @@ async fn ping_plan(
         .into_response()
 }
 // Handler: Trigger Payout
-// Contributors: Implement calculating final payout with yield, parsing fiat payout details,
-// submitting fiat payouts to AnchorRegistry, and marking the plan inactive
 async fn trigger_payout(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<PayoutRequest>,
@@ -1546,6 +1579,28 @@ async fn trigger_payout(
         &beneficiary_addresses,
     )
     .await;
+
+    // 10. Emit plan.settled webhook event (non-blocking; failure is non-fatal)
+    let webhook_payload = serde_json::json!({
+        "plan_id": plan.id,
+        "owner": plan.owner_address,
+        "total_payout": total_payout_dec.to_string(),
+        "status": "SETTLED",
+        "payout_count": payout_rows.len(),
+    });
+    if let Err(e) = crate::WebhookDispatcherService::enqueue_event(
+        &state.db_pool,
+        "plan.settled",
+        &webhook_payload,
+    )
+    .await
+    {
+        tracing::warn!(
+            plan_id = %plan.id,
+            error = ?e,
+            "Failed to enqueue plan.settled webhook"
+        );
+    }
 
     (StatusCode::OK, Json(payout_rows)).into_response()
 }
