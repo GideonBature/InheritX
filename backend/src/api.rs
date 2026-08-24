@@ -22,7 +22,9 @@ use tower_http::cors::CorsLayer;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::auth::{jwt_auth_middleware, signature_auth_middleware, Claims};
+use crate::auth::{
+    jwt_auth_middleware, jwt_or_signature_auth_middleware, signature_auth_middleware, Claims,
+};
 use crate::cache::PlanCache;
 use crate::kyc_webhook::kyc_webhook_handler;
 #[cfg(feature = "metrics")]
@@ -67,6 +69,7 @@ pub struct AppState {
     pub plan_cache: PlanCache,
     pub apy_cache: dashmap::DashMap<String, u32>,
     pub kyc_tx: tokio::sync::broadcast::Sender<crate::ws::KycUpdateEvent>,
+    pub status_tx: tokio::sync::broadcast::Sender<crate::ws::PlanStatusEvent>,
     pub stellar_submit: StellarSubmitClient,
 }
 
@@ -263,6 +266,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
+            HeaderName::from_static("x-public-key"),
+            HeaderName::from_static("x-signature"),
         ])
         .max_age(std::time::Duration::from_secs(3600));
 
@@ -285,12 +290,32 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/plans/{id}/report", get(get_plan_report))
         .route_layer(from_fn(jwt_auth_middleware));
 
+    // Loan lifecycle: admin JWT or wallet signature.
+    let loan_lifecycle_routes = Router::new()
+        .route(
+            "/api/plans/{id}/freeze-loans",
+            post(crate::loan_lifecycle::freeze_loans),
+        )
+        .route(
+            "/api/plans/{id}/recall-loans",
+            post(crate::loan_lifecycle::recall_loans),
+        )
+        .route(
+            "/api/plans/{id}/liquidate-settle",
+            post(crate::loan_lifecycle::liquidate_and_settle),
+        )
+        .route_layer(from_fn(jwt_or_signature_auth_middleware));
+
     // Public or admin routes
     let public_routes = Router::new()
         .route("/api/plans", get(get_plans))
         .route("/api/plans/due-for-claim", get(get_plans_due_for_claim))
         .route("/api/plans/due-for-claim/{id}", get(get_plan_due_for_claim))
         .route("/api/plans/{id}", get(get_plan_by_id))
+        .route(
+            "/api/plans/{id}/trigger-info",
+            get(crate::loan_lifecycle::get_trigger_info),
+        )
         .route("/api/anchor/payout-status", get(get_anchor_payouts))
         .route("/api/lending/current-rate", get(get_current_lending_rate))
         .route("/api/kyc/webhook", post(kyc_webhook_handler))
@@ -307,6 +332,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let router = Router::new()
         .merge(user_routes)
         .merge(admin_routes)
+        .merge(loan_lifecycle_routes)
         .merge(public_routes)
         .layer(axum::middleware::from_fn(move |req, next| {
             rate_limit_middleware(req, next, store.clone(), config.clone())

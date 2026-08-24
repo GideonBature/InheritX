@@ -3904,6 +3904,45 @@ impl InheritanceContract {
         Ok(())
     }
 
+    /// Halt new borrowing against this plan's vault collateral.
+    ///
+    /// `trigger_inheritance` already sets `is_lendable = false`. This entry
+    /// point is the dedicated lifecycle step the backend calls after a plan
+    /// enters the triggered state, so freeze can be confirmed (and re-applied)
+    /// independently of the trigger transaction.
+    ///
+    /// # Errors
+    /// - `InheritanceNotTriggered` if inheritance hasn't been triggered
+    /// - `PlanNotFound` if the plan does not exist
+    /// - `NotAdmin` if the caller is not the admin
+    pub fn freeze_loans(env: Env, admin: Address, plan_id: u64) -> Result<(), InheritanceError> {
+        Self::check_not_paused(&env);
+        Self::require_admin(&env, &admin)?;
+
+        let mut plan = Self::get_plan(&env, plan_id).ok_or(InheritanceError::PlanNotFound)?;
+
+        let mut trigger_info = Self::get_trigger_info(&env, plan_id)
+            .ok_or(InheritanceError::InheritanceNotTriggered)?;
+
+        plan.is_lendable = false;
+        Self::store_plan(&env, plan_id, &plan);
+
+        trigger_info.loan_freeze_active = true;
+        Self::set_trigger_info(&env, plan_id, &trigger_info);
+
+        let now = env.ledger().timestamp();
+        env.events().publish(
+            (symbol_short!("LOAN"), symbol_short!("FREEZE")),
+            LoanFreezeEvent {
+                plan_id,
+                frozen_at: now,
+            },
+        );
+
+        log!(&env, "Loans frozen for plan {}", plan_id);
+        Ok(())
+    }
+
     /// Attempt to recall loaned funds back to the plan.
     /// Called by admin after loan repayment has been collected off-chain
     /// or via cross-contract calls to lending/borrowing contracts.

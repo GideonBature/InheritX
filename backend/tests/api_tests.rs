@@ -47,6 +47,7 @@ fn setup_app_with_cache(plan_cache: PlanCache) -> axum::Router {
         )),
         db_pool,
         kyc_tx: tokio::sync::broadcast::channel(16).0,
+        status_tx: tokio::sync::broadcast::channel(16).0,
         kyc_webhook_secret: None,
         apy_config: inheritx_backend::yield_calculator::ApyConfig::default(),
         plan_cache,
@@ -517,6 +518,7 @@ async fn test_health_endpoint_without_db_yields_service_unavailable() {
         )),
         db_pool,
         kyc_tx: tokio::sync::broadcast::channel(16).0,
+        status_tx: tokio::sync::broadcast::channel(16).0,
         kyc_webhook_secret: None,
         apy_config: inheritx_backend::yield_calculator::ApyConfig::default(),
         plan_cache: PlanCache::disabled(),
@@ -570,6 +572,7 @@ async fn test_get_current_rate_cached() {
         )),
         db_pool,
         kyc_tx: tokio::sync::broadcast::channel(16).0,
+        status_tx: tokio::sync::broadcast::channel(16).0,
         kyc_webhook_secret: None,
         apy_config: inheritx_backend::yield_calculator::ApyConfig::default(),
         plan_cache,
@@ -766,4 +769,101 @@ async fn test_calculate_yield_invalid_amount() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_freeze_loans_requires_auth() {
+    let app = setup_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/api/plans/00000000-0000-0000-0000-000000000001/freeze-loans")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_recall_loans_requires_auth() {
+    let app = setup_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/api/plans/00000000-0000-0000-0000-000000000001/recall-loans")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_liquidate_settle_requires_auth() {
+    let app = setup_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/api/plans/00000000-0000-0000-0000-000000000001/liquidate-settle")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_freeze_loans_valid_signature_reaches_handler() {
+    let app = setup_app();
+    let body = "{}";
+    let (public_key, signature) = generate_valid_signature(body, "");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("/api/plans/00000000-0000-0000-0000-000000000001/freeze-loans")
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .header("X-Public-Key", public_key)
+                .header("X-Signature", signature)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Auth succeeded; the lazy test database is unreachable so the handler
+    // returns 500 rather than 401/404.
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_trigger_info_is_public() {
+    let app = setup_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(http::Method::GET)
+                .uri("/api/plans/00000000-0000-0000-0000-000000000001/trigger-info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }

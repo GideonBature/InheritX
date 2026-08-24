@@ -82,6 +82,30 @@ export interface PlanStatistics {
   }>;
 }
 
+export interface LoanLifecycleResponse {
+  status: string;
+  message: string;
+  data?: {
+    plan_id: string;
+    tx_hash?: string | null;
+    on_chain?: boolean;
+    freeze_status?: string;
+    recall_progress?: number;
+    recalled_amount?: number;
+    settlement_status?: string;
+    settled_amount?: number;
+    remaining_loaned?: number;
+  };
+}
+
+export interface TriggerInfo {
+  timestamp: string | null;
+  freeze_status: string;
+  recall_progress: number;
+  settlement_status: string;
+  outstanding_loans: Array<{ pool: string; amount: string; status: string }>;
+}
+
 export class PlansAPI {
   /**
    * Create a new plan
@@ -181,29 +205,46 @@ export class PlansAPI {
   /**
    * Freeze outstanding loans
    */
-  async freezeLoans(planId: string): Promise<any> {
-    return apiClient.post(`/api/plans/${planId}/freeze-loans`);
+  async freezeLoans(planId: string): Promise<LoanLifecycleResponse> {
+    return apiClient.post<LoanLifecycleResponse>(
+      `/api/plans/${planId}/freeze-loans`,
+      {}
+    );
   }
 
   /**
    * Recall loans from lending pool
    */
-  async recallLoans(planId: string): Promise<any> {
-    return apiClient.post(`/api/plans/${planId}/recall-loans`);
+  async recallLoans(
+    planId: string,
+    recallAmount?: number
+  ): Promise<LoanLifecycleResponse> {
+    return apiClient.post<LoanLifecycleResponse>(
+      `/api/plans/${planId}/recall-loans`,
+      recallAmount !== undefined ? { recall_amount: recallAmount } : {}
+    );
   }
 
   /**
    * Liquidate collateral if loans can't be recalled
    */
-  async liquidateAndSettle(planId: string): Promise<any> {
-    return apiClient.post(`/api/plans/${planId}/liquidate-settle`);
+  async liquidateAndSettle(planId: string): Promise<LoanLifecycleResponse> {
+    return apiClient.post<LoanLifecycleResponse>(
+      `/api/plans/${planId}/liquidate-settle`,
+      {}
+    );
   }
 
   /**
    * Get trigger status and progress
    */
-  async getTriggerInfo(planId: string): Promise<any> {
-    return apiClient.get(`/api/plans/${planId}/trigger-info`);
+  async getTriggerInfo(planId: string): Promise<{
+    status: string;
+    data: TriggerInfo;
+  }> {
+    return apiClient.get<{ status: string; data: TriggerInfo }>(
+      `/api/plans/${planId}/trigger-info`
+    );
   }
 
   /**

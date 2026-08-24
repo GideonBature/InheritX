@@ -2281,6 +2281,52 @@ fn test_trigger_inheritance_inactive_plan_fails() {
 }
 
 #[test]
+fn test_freeze_loans_after_trigger() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    client.trigger_inheritance(&admin, &plan_id);
+    client.freeze_loans(&admin, &plan_id);
+
+    let plan = client.get_plan_details(&plan_id).unwrap();
+    assert!(!plan.is_lendable);
+
+    let info = client.get_inheritance_trigger(&plan_id).unwrap();
+    assert!(info.loan_freeze_active);
+}
+
+#[test]
+fn test_freeze_loans_without_trigger_fails() {
+    let env = Env::default();
+    let (client, token, admin, owner) = setup_with_token_and_admin(&env);
+
+    let plan_id = client.create_inheritance_plan(&plan_params(
+        &env,
+        &owner,
+        &token,
+        "Will",
+        "My will",
+        100_000u64,
+        DistributionMethod::LumpSum,
+        &one_beneficiary(&env, "Alice", "alice@example.com", 123456),
+    ));
+
+    let result = client.try_freeze_loans(&admin, &plan_id);
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_recall_loan_success() {
     let env = Env::default();
     let (client, token, admin, owner) = setup_with_token_and_admin(&env);

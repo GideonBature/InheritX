@@ -106,6 +106,27 @@ pub async fn jwt_auth_middleware(
     Ok(next.run(req).await)
 }
 
+/// Accepts either an admin JWT (`Authorization: Bearer`) or an ed25519
+/// request signature (`X-Public-Key` + `X-Signature`). JWT takes precedence
+/// when both are present so browser clients that attach a token keep working
+/// even if signature headers are incomplete (empty POST bodies are not signed).
+pub async fn jwt_or_signature_auth_middleware(
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let has_bearer = req
+        .headers()
+        .get("Authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Bearer "));
+
+    if has_bearer {
+        jwt_auth_middleware(req, next).await
+    } else {
+        signature_auth_middleware(req, next).await
+    }
+}
+
 pub async fn signature_auth_middleware(
     req: Request<Body>,
     next: Next,

@@ -236,12 +236,72 @@ impl StellarSubmitClient {
         plan_id: u64,
     ) -> Result<InvocationOutcome, StellarSubmitError> {
         let ctx = self.soroban()?;
-        let caller = ScVal::Address(ScAddress::Account(stellar_xdr::AccountId(
-            stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(ctx.public_key)),
-        )));
+        self.invoke_contract(
+            "trigger_inheritance",
+            vec![signer_account_scval(ctx), ScVal::U64(plan_id)],
+        )
+        .await
+    }
 
-        self.invoke_contract("trigger_inheritance", vec![caller, ScVal::U64(plan_id)])
-            .await
+    /// Calls `freeze_loans(admin, plan_id)` to halt new borrowing against the
+    /// plan's vault collateral after inheritance has been triggered.
+    pub async fn freeze_loans(
+        &self,
+        plan_id: u64,
+    ) -> Result<InvocationOutcome, StellarSubmitError> {
+        let ctx = self.soroban()?;
+        self.invoke_contract(
+            "freeze_loans",
+            vec![signer_account_scval(ctx), ScVal::U64(plan_id)],
+        )
+        .await
+    }
+
+    /// Calls `recall_loan(admin, plan_id, recall_amount)` to pull loaned
+    /// capital (and any already-harvested yield sitting in `total_loaned`)
+    /// back into the vault.
+    pub async fn recall_loan(
+        &self,
+        plan_id: u64,
+        recall_amount: u64,
+    ) -> Result<InvocationOutcome, StellarSubmitError> {
+        let ctx = self.soroban()?;
+        self.invoke_contract(
+            "recall_loan",
+            vec![
+                signer_account_scval(ctx),
+                ScVal::U64(plan_id),
+                ScVal::U64(recall_amount),
+            ],
+        )
+        .await
+    }
+
+    /// Calls `liquidation_fallback(admin, plan_id)` to write off unrecoverable
+    /// loaned amounts so settlement can complete.
+    pub async fn liquidation_fallback(
+        &self,
+        plan_id: u64,
+    ) -> Result<InvocationOutcome, StellarSubmitError> {
+        let ctx = self.soroban()?;
+        self.invoke_contract(
+            "liquidation_fallback",
+            vec![signer_account_scval(ctx), ScVal::U64(plan_id)],
+        )
+        .await
+    }
+
+    /// Simulates `get_inheritance_trigger(plan_id)` and, when the plan has
+    /// been triggered, returns the outstanding loaned amount still sitting
+    /// against the vault.
+    pub async fn outstanding_loaned(
+        &self,
+        plan_id: u64,
+    ) -> Result<Option<u64>, StellarSubmitError> {
+        let return_value = self
+            .simulate_contract("get_inheritance_trigger", vec![ScVal::U64(plan_id)])
+            .await?;
+        Ok(parse_outstanding_loaned(&return_value))
     }
 
     /// Builds, simulates, signs and submits a contract invocation, then polls
@@ -305,6 +365,47 @@ impl StellarSubmitClient {
 
         self.send_transaction(ctx, &envelope_xdr, &tx_hash).await?;
         self.await_transaction(ctx, &tx_hash).await
+    }
+
+    /// Simulates a contract invocation without submitting it. Used for view
+    /// functions such as `get_inheritance_trigger`.
+    pub async fn simulate_contract(
+        &self,
+        function_name: &str,
+        args: Vec<ScVal>,
+    ) -> Result<ScVal, StellarSubmitError> {
+        let ctx = self.soroban()?;
+
+        let function_name = ScSymbol(
+            function_name
+                .try_into()
+                .map_err(|_| StellarSubmitError::Config(format!("{function_name} is too long")))?,
+        );
+        let args: VecM<ScVal> = args
+            .try_into()
+            .map_err(|e| StellarSubmitError::Xdr(format!("invocation arguments: {e:?}")))?;
+
+        let sequence = self.next_sequence(ctx).await?;
+        let valid_until = unix_now() + TX_VALID_FOR_SECS;
+
+        let invocation = InvokeContractArgs {
+            contract_address: ScAddress::Contract(ctx.contract.clone()),
+            function_name,
+            args,
+        };
+        let unsigned = build_transaction(
+            ctx,
+            sequence,
+            valid_until,
+            BASE_FEE_STROOPS,
+            invocation,
+            VecM::default(),
+            TransactionExt::V0,
+        )?;
+        let simulation = self.simulate(ctx, &unsigned).await?;
+        simulation
+            .return_value
+            .ok_or_else(|| StellarSubmitError::Simulation("no return value".into()))
     }
 
     fn soroban(&self) -> Result<&SorobanContext, StellarSubmitError> {
@@ -420,6 +521,7 @@ impl StellarSubmitClient {
         #[derive(Deserialize)]
         struct SimulateResult {
             auth: Option<Vec<String>>,
+            xdr: Option<String>,
         }
 
         let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
@@ -452,11 +554,18 @@ impl StellarSubmitClient {
             .parse::<i64>()
             .map_err(|_| StellarSubmitError::Simulation("malformed minResourceFee".into()))?;
 
-        let auth = response
-            .results
-            .unwrap_or_default()
-            .into_iter()
-            .next()
+        let first_result = response.results.unwrap_or_default().into_iter().next();
+
+        let return_value = first_result
+            .as_ref()
+            .and_then(|result| result.xdr.as_deref())
+            .map(|xdr| {
+                ScVal::from_xdr_base64(xdr.trim(), Limits::none())
+                    .map_err(|e| StellarSubmitError::Xdr(format!("simulate return value: {e}")))
+            })
+            .transpose()?;
+
+        let auth = first_result
             .and_then(|result| result.auth)
             .unwrap_or_default()
             .iter()
@@ -473,6 +582,7 @@ impl StellarSubmitClient {
             transaction_data,
             min_resource_fee,
             auth,
+            return_value,
         })
     }
 
@@ -596,6 +706,7 @@ struct Simulation {
     transaction_data: SorobanTransactionData,
     min_resource_fee: i64,
     auth: VecM<SorobanAuthorizationEntry>,
+    return_value: Option<ScVal>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -769,6 +880,82 @@ pub fn event_u64_field(event: &ContractEvent, field: &str) -> Option<u64> {
 
 fn matches_symbol(value: &ScVal, expected: &str) -> bool {
     matches!(value, ScVal::Symbol(symbol) if symbol.0.as_vec().as_slice() == expected.as_bytes())
+}
+
+fn signer_account_scval(ctx: &SorobanContext) -> ScVal {
+    ScVal::Address(ScAddress::Account(stellar_xdr::AccountId(
+        stellar_xdr::PublicKey::PublicKeyTypeEd25519(Uint256(ctx.public_key)),
+    )))
+}
+
+/// Outstanding loaned amount still encumbering the vault, derived from a
+/// `get_inheritance_trigger` return value. `None` means the plan has not
+/// been triggered (the contract returns a Soroban `Option::None`).
+pub fn parse_outstanding_loaned(value: &ScVal) -> Option<u64> {
+    let inner = unwrap_option_scval(value)?;
+    let original = scval_u64_field(inner, "original_loaned")?;
+    let recalled = scval_u64_field(inner, "recalled_amount").unwrap_or(0);
+    let settled = scval_u64_field(inner, "settled_amount").unwrap_or(0);
+    let liquidation = scval_bool_field(inner, "liquidation_triggered").unwrap_or(false);
+    if liquidation {
+        return Some(0);
+    }
+    Some(original.saturating_sub(recalled).saturating_sub(settled))
+}
+
+fn unwrap_option_scval(value: &ScVal) -> Option<&ScVal> {
+    match value {
+        ScVal::Void => None,
+        ScVal::Vec(Some(vec)) => {
+            let items = vec.as_slice();
+            if items.is_empty() {
+                return None;
+            }
+            if matches_symbol(&items[0], "None") {
+                return None;
+            }
+            if matches_symbol(&items[0], "Some") {
+                return items.get(1);
+            }
+            Some(value)
+        }
+        ScVal::Map(Some(_)) => Some(value),
+        _ => Some(value),
+    }
+}
+
+fn scval_map(value: &ScVal) -> Option<&stellar_xdr::ScMap> {
+    match value {
+        ScVal::Map(Some(map)) => Some(map),
+        _ => None,
+    }
+}
+
+pub fn scval_u64_field(value: &ScVal, field: &str) -> Option<u64> {
+    let map = scval_map(value)?;
+    map.0.iter().find_map(|entry| {
+        if !matches_symbol(&entry.key, field) {
+            return None;
+        }
+        match entry.val {
+            ScVal::U64(v) => Some(v),
+            ScVal::U32(v) => Some(u64::from(v)),
+            _ => None,
+        }
+    })
+}
+
+pub fn scval_bool_field(value: &ScVal, field: &str) -> Option<bool> {
+    let map = scval_map(value)?;
+    map.0.iter().find_map(|entry| {
+        if !matches_symbol(&entry.key, field) {
+            return None;
+        }
+        match entry.val {
+            ScVal::Bool(v) => Some(v),
+            _ => None,
+        }
+    })
 }
 
 fn unix_now() -> u64 {
@@ -968,5 +1155,119 @@ mod tests {
         )
         .to_string();
         assert_eq!(source, expected);
+    }
+
+    fn trigger_info_map(
+        original_loaned: u64,
+        recalled_amount: u64,
+        settled_amount: u64,
+        liquidation_triggered: bool,
+    ) -> ScVal {
+        ScVal::Map(Some(ScMap(
+            vec![
+                ScMapEntry {
+                    key: symbol("original_loaned"),
+                    val: ScVal::U64(original_loaned),
+                },
+                ScMapEntry {
+                    key: symbol("recalled_amount"),
+                    val: ScVal::U64(recalled_amount),
+                },
+                ScMapEntry {
+                    key: symbol("settled_amount"),
+                    val: ScVal::U64(settled_amount),
+                },
+                ScMapEntry {
+                    key: symbol("liquidation_triggered"),
+                    val: ScVal::Bool(liquidation_triggered),
+                },
+            ]
+            .try_into()
+            .unwrap(),
+        )))
+    }
+
+    fn loan_event(
+        contract_id: ContractId,
+        topics: [&str; 2],
+        fields: Vec<(&str, u64)>,
+    ) -> ContractEvent {
+        ContractEvent {
+            ext: ExtensionPoint::V0,
+            contract_id: Some(contract_id),
+            type_: stellar_xdr::ContractEventType::Contract,
+            body: ContractEventBody::V0(stellar_xdr::ContractEventV0 {
+                topics: vec![symbol(topics[0]), symbol(topics[1])]
+                    .try_into()
+                    .unwrap(),
+                data: ScVal::Map(Some(ScMap(
+                    fields
+                        .into_iter()
+                        .map(|(key, val)| ScMapEntry {
+                            key: symbol(key),
+                            val: ScVal::U64(val),
+                        })
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap(),
+                ))),
+            }),
+        }
+    }
+
+    #[test]
+    fn parse_outstanding_loaned_treats_void_as_not_triggered() {
+        assert_eq!(parse_outstanding_loaned(&ScVal::Void), None);
+    }
+
+    #[test]
+    fn parse_outstanding_loaned_subtracts_recalled_and_settled() {
+        let value = trigger_info_map(50_000, 30_000, 0, false);
+        assert_eq!(parse_outstanding_loaned(&value), Some(20_000));
+    }
+
+    #[test]
+    fn parse_outstanding_loaned_is_zero_after_liquidation() {
+        let value = trigger_info_map(40_000, 10_000, 30_000, true);
+        assert_eq!(parse_outstanding_loaned(&value), Some(0));
+    }
+
+    #[test]
+    fn finds_loan_freeze_recall_and_liquidate_events() {
+        let events = vec![
+            loan_event(
+                contract(1),
+                ["LOAN", "FREEZE"],
+                vec![("plan_id", 7), ("frozen_at", 1)],
+            ),
+            loan_event(
+                contract(1),
+                ["LOAN", "RECALL"],
+                vec![
+                    ("plan_id", 7),
+                    ("recalled_amount", 1_000),
+                    ("remaining_loaned", 500),
+                ],
+            ),
+            loan_event(
+                contract(1),
+                ["LOAN", "LIQUIDAT"],
+                vec![
+                    ("plan_id", 7),
+                    ("settled_amount", 500),
+                    ("claimable_amount", 9_500),
+                ],
+            ),
+        ];
+
+        let freeze = find_event(&events, &contract(1), &["LOAN", "FREEZE"]).unwrap();
+        assert_eq!(event_u64_field(freeze, "plan_id"), Some(7));
+
+        let recall = find_event(&events, &contract(1), &["LOAN", "RECALL"]).unwrap();
+        assert_eq!(event_u64_field(recall, "recalled_amount"), Some(1_000));
+        assert_eq!(event_u64_field(recall, "remaining_loaned"), Some(500));
+
+        let liquidate = find_event(&events, &contract(1), &["LOAN", "LIQUIDAT"]).unwrap();
+        assert_eq!(event_u64_field(liquidate, "settled_amount"), Some(500));
     }
 }

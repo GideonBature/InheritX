@@ -6,6 +6,7 @@ pub mod db;
 pub mod inactivity_watchdog;
 
 pub mod kyc_webhook;
+pub mod loan_lifecycle;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod middleware;

@@ -89,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (kyc_tx, _) = tokio::sync::broadcast::channel(100);
+    let (status_tx, _) = tokio::sync::broadcast::channel(100);
     // Initialize state
     let state = Arc::new(AppState {
         anchor: Arc::new(inheritx_backend::stellar_anchor::AnchorRegistry::new(
@@ -100,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         plan_cache: plan_cache.clone(),
         apy_cache: dashmap::DashMap::new(),
         kyc_tx: kyc_tx.clone(),
+        status_tx,
         stellar_submit: stellar_submit.clone(),
     });
 
